@@ -20,7 +20,7 @@ export const ACCESS_SEEN_FILE = 'mcp-access-seen';
 const FINGERPRINT = /^[hv]:[\w.:-]{1,128}$/;
 
 export function accessSeenStore(c: Connection): AccessStore | undefined {
-  if (c.source === 'environment' || c.source === 'environment-token' || !c.keyPair) return undefined;
+  if (c.source === 'environment' || c.source === 'environment-token' || c.source === 'credentials-file' || !c.keyPair) return undefined;
   const file = path.join(path.dirname(c.paths.tokenFile), ACCESS_SEEN_FILE);
   const key = keyFingerprint(c.keyPair);
   return {

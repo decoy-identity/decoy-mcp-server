@@ -196,6 +196,8 @@ export class LockError extends Error {}
  * time — the caller then re-reads the file instead of writing.
  */
 type LockOptions = { waitMs?: number; staleMs?: number; pollMs?: number };
+/** How long a caller waits for a lock another holder keeps, unless it says otherwise. */
+export const LOCK_WAIT_MS = 15_000;
 
 /** One attempt. 'taken' = this caller now holds it; 'busy' = wait and try again; 'never' = it can't be locked here. */
 function tryTakeLock(lock: string, me: string, staleMs: number): 'taken' | 'busy' | 'never' {
@@ -242,7 +244,7 @@ const lockId = () => `${process.pid}:${randomBytes(8).toString('hex')}`;
 export type NotHeld = { held: false; why: 'held' | 'unusable' };
 export async function withFileLock<T>(file: string, fn: () => Promise<T>, opts: LockOptions = {}): Promise<{ held: true; value: T } | NotHeld> {
   const lock = `${file}.lock`, me = lockId();
-  const deadline = Date.now() + (opts.waitMs ?? 15_000);
+  const deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS);
   for (let first = true; ; first = false) {
     if (!first && Date.now() >= deadline) return { held: false, why: 'held' };
     const got = tryTakeLock(lock, me, opts.staleMs ?? LOCK_STALE_MS);

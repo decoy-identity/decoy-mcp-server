@@ -2,19 +2,25 @@
  * Where this bridge's connection comes from, and where a renewed token goes.
  *
  * A connection is three secrets: the agent's private key (what Decoy seals to this agent can only
- * be opened with it), an access token, and the refresh token that renews it. Two sources:
+ * be opened with it), an access token, and the refresh token that renews it. Three sources:
  *
  *   files         ~/.decoy/mcp-token and ~/.decoy/mcp-agent-key.json, written at pairing
  *                 (directory 0700, files 0600). The default.
  *   environment   DECOY_AGENT_KEY + DECOY_AGENT_TOKEN (+ DECOY_AGENT_REFRESH_TOKEN), for a runtime
  *                 with no lasting disk. Used only as a complete set, and then nothing under
- *                 ~/.decoy is read for secrets or written. A refresh token is replaced every time
+ *                 ~/.decoy is read for secrets, and no secret is written there. A refresh token is replaced every time
  *                 it is used, so it is only ever used when DECOY_CREDENTIALS_FILE names a file the
  *                 bridge may write the new pair to; once that file exists it holds the latest pair
  *                 and is read first.
+ *   credentials   DECOY_CREDENTIALS_FILE on its own (no DECOY_AGENT_KEY): one JSON file that IS
+ *   file          the connection, for a runtime whose disk does not last past a task. It holds
+ *                 the fields of the two saved files together: access_token, refresh_token,
+ *                 api_host, privateKeyPem (and key_fingerprint, publicKeySpki). Nothing under
+ *                 ~/.decoy is read for secrets, and no secret is written there. A renewed pair is written back to that
+ *                 file with the key, under its lock, and only over the token it was renewed from.
  *
- * The credentials file is BOUND to the connection it was written for: it records the fingerprint
- * of the agent key and a hash of the environment access token it superseded (and the pinned client
+ * With DECOY_AGENT_KEY set, the credentials file holds tokens only and is BOUND to the connection
+ * it was written for: it records the fingerprint of the agent key and a hash of the environment access token it superseded (and the pinned client
  * id). A file that doesn't match what the environment holds now — an old one left on a volume
  * after a new pairing, or one from elsewhere — is refused, never used and never ignored: using it
  * would speak as the old connection with the new key, and ignoring it would spend a refresh token
@@ -32,7 +38,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, randomBytes } from 'node:crypto';
 import { readSecretFile, writeSecretFile, writeSecretFileIn, readSecretFileIn, removeLeftoverTemps, withFileLock, LOCK_STALE_MS, LockError, type NotHeld, SecretFileError, SecretDirError } from './secret-file.js';
-import { parseSavedCredentials, parseKeyFile, serializeCredentials, savedKeyFingerprint, type AgentKeyPair, type SavedCredentials } from './credentials.js';
+import { parseSavedCredentials, parseKeyFile, serializeCredentials, savedKeyFingerprint, isTokenShaped, type AgentKeyPair, type SavedCredentials } from './credentials.js';
+import { DEFAULT_API_URL } from './api-config.js';
 
 export const CONNECTION_ENV = {
   key: 'DECOY_AGENT_KEY',
@@ -49,6 +56,7 @@ const UNCHANGED = 'Nothing was changed.';
 const CLIENT_ID_OK = /^[A-Za-z0-9._:-]{1,128}$/;
 const GENERATED_CLIENT_ID = /^decoy-mcp-server\.[0-9a-f-]{36}$/;
 const sha256 = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
+const PRODUCTION_HOST = new URL(DEFAULT_API_URL).host;
 
 /** How long a renewal request may take. Well inside the lock's stale threshold (secret-file
  *  LOCK_STALE_MS), so a renewal still running is never mistaken for a dead bridge's. */
@@ -113,11 +121,20 @@ export function serializeBoundCredentials(b: BoundCredentials): string {
   }) + '\n';
 }
 
-export type ConnectionSource = 'files' | 'environment' | 'environment-token' | 'none';
+export type ConnectionSource = 'files' | 'environment' | 'environment-token' | 'credentials-file' | 'none';
+
+/** What DECOY_CREDENTIALS_FILE holds when it is the whole connection: the saved files' fields in one object. */
+export function serializeWholeConnection(accessToken: string, refreshToken: string | undefined, apiHost: string, keyPair: AgentKeyPair): string {
+  return JSON.stringify({
+    access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }), api_host: apiHost,
+    key_fingerprint: keyFingerprint(keyPair), publicKeySpki: publicKeyOf(keyPair.privateKeyPem), privateKeyPem: keyPair.privateKeyPem,
+  }) + '\n';
+}
 
 export interface Connection {
   /** files = ~/.decoy; environment = a complete set of variables; environment-token = the
-   *  long-standing DECOY_AGENT_TOKEN with the key file; none = nothing saved, pair. */
+   *  long-standing DECOY_AGENT_TOKEN with the key file; credentials-file = DECOY_CREDENTIALS_FILE
+   *  on its own, holding the whole connection; none = nothing saved, pair. */
   readonly source: ConnectionSource;
   /** The key this connection was paired with (null only when there is nothing saved yet). */
   readonly keyPair: AgentKeyPair | null;
@@ -179,6 +196,9 @@ export interface OpenConnectionOptions {
   log: (line: string) => void;
   /** --reconnect: pair again although a token is saved. */
   reconnect?: boolean;
+  /** A one-shot command: the lines that only say where the connection comes from are not logged
+   *  (they would be repeated on every call). Everything that reports a change or a problem still is. */
+  quiet?: boolean;
   /** Test seams for the commit: after the token's temp file is written, and just before it is renamed into place. */
   hooks?: { afterTempWrite?: (file: string) => void; beforeTokenRename?: () => void };
   /** How long to wait for another bridge's renewal (tests shorten it). */
@@ -192,6 +212,7 @@ const val = (env: Record<string, string | undefined>, name: string): string | un
 
 export function openConnection(opts: OpenConnectionOptions): Connection {
   const { env, apiHost, log } = opts;
+  const info = opts.quiet ? () => {} : log;
   const E = CONNECTION_ENV;
   const dir = path.join(opts.home, '.decoy');
   const tokenFile = path.join(dir, 'mcp-token');
@@ -216,9 +237,12 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     throw new CredentialSetupError(`${E.refreshToken} is set without ${E.key}: a refresh token is used only with the complete set ` +
       `(${E.key}, ${E.accessToken}, ${E.refreshToken}, ${E.credentialsFile}). Set them all, or unset ${E.refreshToken}. ${UNCHANGED}`);
   }
-  if (!fromEnvironment && sink !== undefined) {
-    throw new CredentialSetupError(`${E.credentialsFile} is set without ${E.key}: it is where a renewed token is saved for credentials that come from the ` +
-      `environment. Set ${E.key} and ${E.accessToken} too, or unset ${E.credentialsFile} to use the files in ${dir}. ${UNCHANGED}`);
+  // DECOY_CREDENTIALS_FILE on its own is the whole connection. Beside a token from the environment
+  // it would be a key from one place and a token from another.
+  const fromFile = !fromEnvironment && sink !== undefined;
+  if (fromFile && envToken !== undefined) {
+    throw new CredentialSetupError(`${E.credentialsFile} is set with ${E.accessToken} but without ${E.key}: on its own the file is the whole connection ` +
+      `(unset ${E.accessToken}), and tokens from the environment are used only with ${E.key}. ${UNCHANGED}`);
   }
   if (sink !== undefined && !path.isAbsolute(sink)) {
     throw new CredentialSetupError(`${E.credentialsFile} must be an absolute path to a file this process may write. ${UNCHANGED}`);
@@ -227,6 +251,10 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     throw new CredentialSetupError(`${E.refreshToken} needs ${E.credentialsFile}: a refresh token is replaced every time it is used, so the bridge only ` +
       `renews when it has a file to write the new pair to (otherwise the next start would hold a dead token). Set ${E.credentialsFile} to an absolute ` +
       `path, or unset ${E.refreshToken} and reconnect when the access token expires. ${UNCHANGED}`);
+  }
+  if (opts.reconnect && fromFile) {
+    throw new CredentialSetupError(`--reconnect pairs over the files in ${dir}; the connection in the file ${E.credentialsFile} names is the host's to replace. ` +
+      `Unset ${E.credentialsFile}, then start the bridge to pair. ${UNCHANGED}`);
   }
   if (opts.reconnect && (fromEnvironment || envToken !== undefined)) {
     throw new CredentialSetupError(`--reconnect pairs over the files in ${dir}; credentials that come from the environment are the host's to replace. ` +
@@ -315,12 +343,12 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       return { access_token: p.access_token, ...(typeof p.refresh_token === 'string' && p.refresh_token ? { refresh_token: p.refresh_token } : {}) };
     };
     const first = readSink();   // refuse a wrong file now, not at the first renewal
-    log(first
+    info(first
       ? `[Decoy] Using the agent key from the environment (${E.key}) and the latest tokens from ${E.credentialsFile} (${sink}).`
       : `[Decoy] Using the agent key and token from the environment (${E.key}, ${E.accessToken}).`);
     const renewable = sink !== undefined && (envRefresh !== undefined || !!first?.refresh_token);
     if (!renewable) {
-      log(`[Decoy] This connection will not be renewed: ${sink ? `no refresh token (${E.refreshToken})` : `no ${E.credentialsFile} to save a renewed token to`}. ` +
+      info(`[Decoy] This connection will not be renewed: ${sink ? `no refresh token (${E.refreshToken})` : `no ${E.credentialsFile} to save a renewed token to`}. ` +
         'When the access token expires, pair again with --reconnect on a machine that has this connection\'s key file, and choose Reconnect in the Decoy app.');
     }
     let memory: SavedCredentials | null = null;   // a save with no file to write to: this process only
@@ -348,6 +376,107 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       },
       withRenewLock: (fn) => (sink ? withFileLock(sink, fn, opts.lock) : fn().then((value) => ({ held: true as const, value }))),
       keyPairForPairing: () => { throw new CredentialSetupError(`Credentials come from the environment; this bridge does not pair over them. ${UNCHANGED}`); },
+    };
+  }
+
+  // ── A credentials file that is the whole connection ──────────────────────────────────────────
+  if (fromFile) {
+    const file = sink!;
+    const SHAPE = 'On its own that file is the whole connection: one JSON object with access_token and privateKeyPem (the agent key, PKCS#8 PEM), ' +
+      'refresh_token to renew, and api_host when it is not Decoy\'s own';
+    const refuse = (why: string): never => {
+      throw new CredentialSetupError(`The file ${E.credentialsFile} names can't be used: ${why}. ${SHAPE}. ${UNCHANGED} File: ${file}`);
+    };
+    for (const left of removeLeftoverTemps(file)) log(`[Decoy] Removed a temp file an interrupted write left beside ${E.credentialsFile}: ${left}`);
+    type Whole = { credentials: SavedCredentials; keyPair: AgentKeyPair };
+    const readWhole = (): Whole | null => {
+      let raw: string | null;
+      try { raw = readSecretFileIn(file); } catch (err) {
+        if (err instanceof SecretDirError) {
+          throw new CredentialSetupError(`The directory ${E.credentialsFile} is in can't be used: ${err.message}. Point ${E.credentialsFile} at a file in a ` +
+            `directory that belongs to this user (or to root) and that not everyone can write to. ${UNCHANGED}`);
+        }
+        return refuse(err instanceof SecretFileError ? err.message : 'it could not be read');
+      }
+      if (raw === null) return null;
+      let p: Record<string, unknown> | null = null;
+      try { const j: unknown = JSON.parse(raw); if (j && typeof j === 'object' && !Array.isArray(j)) p = j as Record<string, unknown>; } catch { p = null; }
+      if (!p) return refuse('it is not a credentials file (not a JSON object)');
+      if (!isTokenShaped(p.access_token)) return refuse('it holds no access token (access_token)');
+      if (typeof p.privateKeyPem !== 'string' || !p.privateKeyPem) {
+        return refuse(`it holds no agent key (privateKeyPem). A file with tokens only is used together with ${E.key} and ${E.accessToken}`);
+      }
+      let keyPair: AgentKeyPair;
+      try {
+        const key = createPrivateKey(p.privateKeyPem);
+        if (key.asymmetricKeyType !== 'rsa' || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error('not this connection\'s kind of key');
+        keyPair = { publicKeySpki: (createPublicKey(key).export({ type: 'spki', format: 'der' }) as Buffer).toString('base64'), privateKeyPem: key.export({ type: 'pkcs8', format: 'pem' }) as string };
+      } catch {
+        // The parser's own message is dropped on purpose: only the field is named.
+        return refuse('its privateKeyPem is not an RSA private key of at least 2048 bits in PEM');
+      }
+      const issuedBy = typeof p.api_host === 'string' && p.api_host ? p.api_host : PRODUCTION_HOST;
+      if (issuedBy !== apiHost) return refuse(`it belongs to ${issuedBy}, and this bridge is set to ${apiHost}`);
+      if (typeof p.key_fingerprint === 'string' && p.key_fingerprint && p.key_fingerprint !== keyFingerprint(keyPair)) {
+        return refuse('its tokens were issued for a different agent key than the one in it (key_fingerprint does not match privateKeyPem)');
+      }
+      return { credentials: { access_token: p.access_token, ...(typeof p.refresh_token === 'string' && p.refresh_token ? { refresh_token: p.refresh_token } : {}) }, keyPair };
+    };
+    const first = readWhole() ?? refuse('it is not there');
+    const fingerprint = keyFingerprint(first.keyPair);
+    let last: SavedCredentials = first.credentials;         // what this process last read or saved
+    let memory: SavedCredentials | null = null;             // a renewed pair that could not be written: this process only
+    note(first.credentials.access_token, first.credentials.refresh_token);
+    info(`[Decoy] Using the connection in ${E.credentialsFile} (${file}).`);
+    /** The file as it is now, when it still holds this process's key; null when it is gone or holds another. */
+    const current = (): Whole | 'another' | null => {
+      let now: Whole | null;
+      try { now = readWhole(); } catch { return 'another'; }
+      if (!now) return null;
+      if (keyFingerprint(now.keyPair) !== fingerprint) return 'another';
+      note(now.credentials.access_token, now.credentials.refresh_token);
+      return now;
+    };
+    return {
+      source: 'credentials-file', keyPair: first.keyPair, paths, clientId, ...notPairing,
+      credentials: () => {
+        if (memory) return memory;
+        const now = current();
+        if (now && now !== 'another') last = now.credentials;
+        return last;
+      },
+      adoptable: (failedBearer) => {
+        if (memory) return memory.access_token !== failedBearer ? { adopt: memory.access_token } : null;
+        const now = current();
+        if (now === 'another') return { mismatch: true as const };
+        if (!now || now.credentials.access_token === failedBearer) return null;
+        last = now.credentials;
+        return { adopt: now.credentials.access_token };
+      },
+      canRenew: () => { const now = current(); return !memory && !!now && now !== 'another' && !!now.credentials.refresh_token; },
+      // Called inside withRenewLock: only over the token the renewal started from, and only while the file still holds this key.
+      save: (accessToken, refreshToken, renewedFrom) => {
+        note(accessToken, refreshToken);
+        const keep = () => { memory = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) }; };
+        const now = current();
+        if (!now || now === 'another' || now.credentials.access_token !== (renewedFrom ?? last.access_token)) {
+          keep();
+          log(`[Decoy] The file ${E.credentialsFile} names no longer holds the token that was renewed (it was replaced or removed meanwhile); the renewed token was not saved.`);
+          return;
+        }
+        try {
+          writeSecretFileIn(file, serializeWholeConnection(accessToken, refreshToken, apiHost, first.keyPair));
+          last = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
+          log(`[Decoy] Saved the renewed token to ${E.credentialsFile} (${file}).`);
+        } catch {
+          keep();
+          log(`[Decoy] WARNING: could not write the renewed token to ${E.credentialsFile} (${file}). It works until this process stops; the token in ` +
+            'the file has been replaced and will be refused at the next start. Fix the path, or pair again with --reconnect on a machine that has this connection\'s key file, and choose Reconnect.');
+        }
+      },
+      // The lock file is made in the directory the result is written to: where it cannot be made, nothing is renewed.
+      withRenewLock: (fn) => withFileLock(file, fn, opts.lock),
+      keyPairForPairing: () => { throw new CredentialSetupError(`The connection comes from the file ${E.credentialsFile} names; this bridge does not pair over it. ${UNCHANGED}`); },
     };
   }
 
@@ -384,7 +513,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
         `Restore the key this connection was paired with (set ${E.key}, or put the key file back), or unset ${E.accessToken} and start the bridge to pair again ` +
         `(a new connection). ${UNCHANGED}`);
     }
-    log(`[Decoy] Using the access token from ${E.accessToken} with the agent key in ${keyFile}. It carries no refresh token and is not renewed.`);
+    info(`[Decoy] Using the access token from ${E.accessToken} with the agent key in ${keyFile}. It carries no refresh token and is not renewed.`);
     return {
       source: 'environment-token', keyPair: keyForEnv, paths, clientId, ...notPairing,
       credentials: () => ({ access_token: envToken }),

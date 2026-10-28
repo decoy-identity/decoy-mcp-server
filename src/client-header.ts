@@ -1,8 +1,10 @@
 // Which client is calling. Every request the bridge sends to Decoy carries one header that names
-// this package and its version, and says when the request comes from a `--context` run:
+// this package and its version, and says when the request comes from a `--context` run or from a
+// one-shot `call`:
 //
 //   X-Decoy-Client: decoy-mcp-server/1.2.3
 //   X-Decoy-Client: decoy-mcp-server/1.2.3; mode=context
+//   X-Decoy-Client: decoy-mcp-server/1.2.3; mode=call
 //
 // That is all it says. Nothing about the machine, the user, the host application or the session
 // is ever put in it, and no other identifying header is added. It goes to the API host this bridge
@@ -14,7 +16,7 @@
 export const CLIENT_HEADER = 'X-Decoy-Client';
 export const CLIENT_NAME = 'decoy-mcp-server';
 
-export function clientHeaderValue(version: string, mode?: 'context'): string {
+export function clientHeaderValue(version: string, mode?: 'context' | 'call'): string {
   return `${CLIENT_NAME}/${version}${mode ? `; mode=${mode}` : ''}`;
 }
 

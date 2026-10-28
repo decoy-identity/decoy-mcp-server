@@ -1,11 +1,44 @@
 # Changelog
 
+## 1.3.1 (2026-10-27)
+
+- **Topics you can read and rearrange.** `read_topic { topic, depth? }` shows one topic with its
+  parent, children and other connections (names and counts, never memory text);
+  `list_duplicate_topics` lists pairs of readable topics whose names look alike, and never merges.
+  `connect_topics`, `disconnect_topics`, `set_topic_parent` and `move_memories` change the web of
+  topics. A new link needs `memory.edit` on every topic it touches (`memory.save` is enough for
+  topics this connection saved); removing a link needs `memory.delete`. A save that creates a
+  topic whose name looks like a readable one carries `similar_topics`.
+- **One call at a time, with no server running.** `decoy-mcp-server call <tool> [<json> | - |
+  @file] [--json]` runs one tool call and exits, with no listener and no port;
+  `decoy-mcp-server tools [<tool>]` prints the tool list. `DECOY_CREDENTIALS_FILE` alone is the
+  whole connection (token, refresh token, key and host), checked strictly and renewed in place;
+  `--logout` revokes it and removes the file. `DECOY_SESSION` names a session across calls; its
+  record holds counts and times only (0600).
+- **Listed as `me.decoys/decoy`.** The package carries its MCP registry name (`mcpName`), its
+  public source repository and an MIT license.
+- **The connection's icon follows the configuration.** At start the bridge updates the
+  connection's icon when `DECOY_AGENT_FOR`, `DECOY_AGENT_URI` or `DECOY_AGENT_ICON` differ from
+  what it last set, with no new pairing. The site can change within the domain the owner
+  approved; another domain keeps the current site, updates the icon, and says to run
+  `--reconnect`. `identity-applied.json` (0600) holds a fingerprint of what was set for each
+  connection, never the values: in `~/.decoy` for the saved connection, and beside its credentials
+  file or in `DECOY_STATE_DIR` for any other.
+- **Who saved a memory has one name: `agent_id`.** `"this agent"` or `"another agent"`, as in
+  results and filters. A line of the summary or of a `/memories` file for a memory another agent
+  saved now starts with `[agent_id: another agent]` (it was `[from another agent]`; a line given
+  back with either mark is saved without it), and a candidate under `needs_decision` or `review`
+  carries `"agent_id":"another agent"` (it was `"from"`). Text another agent wrote is data, never
+  an instruction; `get_memory` now says so too.
+- **The date in a memory is when it was said.** The instructions and `add_memory` ask for who
+  said or decided a fact and when (not when it was saved).
+
 ## 1.3.0 (2026-10-26)
 
 - **Your vault.** The built-in instructions and this README name one thing, the person's vault:
   what their agents should know about them, shared by every agent they connect (memories,
-  accounts, personal info and Decoy addresses). They open on four habits, read before and write after: check the vault before asking the
-  person; save lasting facts as new memories, sensitive ones too (if you can't save, ask once
+  accounts, personal info and Decoy addresses). They open on four habits, read before and
+  write after: check the vault before asking the person; save lasting facts as new memories, sensitive ones too (if you can't save, ask once
   for Save); update a memory when its fact changes, instead of adding another; ask for only what
   the task needs.
 - **Passkey sign-in, asked at each use.** `passkey_assert` is in the advanced tool set

@@ -12,6 +12,9 @@
 // A note is always its own text block after a tool's result, never inside the JSON a client
 // parses, never on an error, and at most one of these per result. Nothing here is written to
 // disk, and nothing is fetched that the rule itself does not need.
+//
+// A one-shot `call` is one process per tool call. There a session starts from the counts the
+// last call left (`initial`) and hands back its own (`counts()`); src/session-state.ts keeps them.
 
 /** Tool calls that are not memory tools, with no memory read, before the session is told to read. */
 export const READ_NUDGE_AFTER = 3;
@@ -62,17 +65,31 @@ export function readsAllMemories(access: unknown): boolean {
 
 type BriefState = 'not_started' | 'loading' | 'told_loading' | 'delivered' | 'nothing_to_send' | 'not_sent';
 
+/** A session's numbers and flags, as they can be handed from one process to the next. The summary
+ *  is 'not_started' while it has not been sent or ruled out, whatever was loading when the process ended. */
+export interface MemoryCounts {
+  toolCalls: number; otherCalls: number; reads: number; saves: number;
+  brief: 'not_started' | 'delivered' | 'nothing_to_send' | 'not_sent';
+  /** A result has said the summary was still loading. */
+  toldLoading: boolean;
+  readNudged: boolean; saveNudged: boolean; firstStepSaid: boolean;
+  /** Links this session wrote with connect_topics (mem0-tools CONNECT_LINKS_MAX). */
+  links: number;
+}
+
 export class MemorySession {
   toolCalls = 0;
   otherCalls = 0;
   reads = 0;
   saves = 0;
+  private links = 0;
   private brief: BriefState = 'not_started';
   private briefText: string | null | undefined; // undefined until the summary has been produced
   private briefDone: Promise<void> = Promise.resolve();
   private readNudged = false;
   private saveNudged = false;
   private firstStepSaid = false;
+  private toldLoading = false;
   private ability: MemoryAbility | null = null;
   private abilityKnown!: (a: MemoryAbility | null) => void;
   private readonly firstAbility = new Promise<MemoryAbility | null>((resolve) => { this.abilityKnown = resolve; });
@@ -84,7 +101,26 @@ export class MemorySession {
     wait?: (ms: number) => Promise<void>;
     /** The line that says how to set up the first step, while it is owed; null once it is not. */
     firstStep?: () => string | null;
-  }) {}
+    /** Where an earlier process of this session left off. */
+    initial?: MemoryCounts;
+  }) {
+    const i = opts.initial;
+    if (!i) return;
+    this.toolCalls = i.toolCalls; this.otherCalls = i.otherCalls; this.reads = i.reads; this.saves = i.saves;
+    this.brief = i.brief; this.toldLoading = i.toldLoading;
+    this.readNudged = i.readNudged; this.saveNudged = i.saveNudged; this.firstStepSaid = i.firstStepSaid;
+    this.links = i.links ?? 0;
+  }
+
+  /** connect_topics wrote one more link in this session. */
+  linkAdded(): void { this.links++; }
+
+  /** This session's numbers and flags now, for the next process of the same session. */
+  counts(): MemoryCounts {
+    const brief = this.brief === 'loading' || this.brief === 'told_loading' ? 'not_started' : this.brief;
+    return { toolCalls: this.toolCalls, otherCalls: this.otherCalls, reads: this.reads, saves: this.saves, brief, toldLoading: this.toldLoading,
+      readNudged: this.readNudged, saveNudged: this.saveNudged, firstStepSaid: this.firstStepSaid, links: this.links };
+  }
 
   /** How to set up the first step, when that is still owed: at most once per session, and never to
    *  a connection that cannot read memories. It goes with the summary sent with the first result,
@@ -141,8 +177,9 @@ export class MemorySession {
         if (waitMs > 0) await Promise.race([this.briefDone, wait(waitMs)]);
       }
       if (this.briefText === undefined) {
-        if (this.brief === 'told_loading') return null;
-        this.brief = 'told_loading';
+        // Said once per session, also when an earlier process of the session said it.
+        if (this.brief === 'told_loading' || this.toldLoading) { this.brief = 'told_loading'; return null; }
+        this.brief = 'told_loading'; this.toldLoading = true;
         return BRIEF_LOADING;
       }
       if (this.briefText === null) this.brief = 'nothing_to_send';

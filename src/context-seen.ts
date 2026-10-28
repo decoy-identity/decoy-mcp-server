@@ -84,7 +84,7 @@ export function isUnansweredRun(text: string, key: string): boolean {
 }
 
 export function contextSeenStore(c: Connection): ContextSeenStore | undefined {
-  if (c.source === 'environment' || c.source === 'environment-token' || !c.keyPair) return undefined;
+  if (c.source === 'environment' || c.source === 'environment-token' || c.source === 'credentials-file' || !c.keyPair) return undefined;
   const file = path.join(path.dirname(c.paths.tokenFile), CONTEXT_SEEN_FILE);
   const key = keyFingerprint(c.keyPair);
   // Only beside a connection that is itself saved: nothing is written for one held in memory.

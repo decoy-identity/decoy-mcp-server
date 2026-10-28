@@ -1,6 +1,6 @@
 {
   "name": "decoy-mcp-server",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "mcpName": "me.decoys/decoy",
   "description": "Decoy is where a person keeps what their agents know about them: an end-to-end-encrypted memory shared by every agent they connect. This local MCP bridge lets an agent read it before every task and save to it as it works. It also holds their account logins, email aliases and codes, for tasks that need to sign in. The bridge decrypts on your machine; Decoy's servers store ciphertext.",
   "author": "Decoy (https://decoys.me)",
