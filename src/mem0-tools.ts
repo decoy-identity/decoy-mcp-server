@@ -373,8 +373,10 @@ export function topicLinkOf(l: string | { to?: string; relation?: string } | und
   return typeof l === 'string' ? { relation: l } : l;
 }
 
+const MEMORY_TITLE_HELP = 'A short title, on one line, for a page: one subject whose facts belong together, such as a trip plan or a project. Leave it out for a fact that stands alone. It is separate from the text: do not repeat it as a first heading.';
+
 export interface AddInput {
-  text: string; messages?: ChatMessage[]; app_id?: string; metadata?: Record<string, unknown>; categories?: string[];
+  text: string; title?: string; messages?: ChatMessage[]; app_id?: string; metadata?: Record<string, unknown>; categories?: string[];
   topic?: string; topic_type?: string; topic_link?: string | { to?: string; relation?: string };
   /** The id of the memory this one replaces: that memory is corrected in place. */
   supersedes?: string;
@@ -429,7 +431,7 @@ export function closeTier(text: string, existing: string, similarity: number, sa
 }
 /** Said in a result when a topic was created from the user with the relation the bridge fills in. */
 export const RELATION_DEFAULTED = `This topic was created with the relation "${DEFAULT_TOPIC_RELATION}" because the call named none. When you create a topic, pass topic_link.relation: what is true and specific for this person and subject.`;
-export interface UpdateInput { text?: string; categories?: string[]; topic?: string | null; topic_type?: string; topic_link?: string | { to?: string; relation?: string }; expected_rev?: number }
+export interface UpdateInput { text?: string; title?: string; categories?: string[]; topic?: string | null; topic_type?: string; topic_link?: string | { to?: string; relation?: string }; expected_rev?: number }
 
 type Filters = Record<string, unknown>;
 
@@ -465,7 +467,7 @@ export class Mem0Memories {
     const app = oneLine(r.accountId ? byAccount.get(r.accountId) ?? r.entityName : r.aboutHint, NAME_CHARS);
     const agent = r.mine ? THIS_AGENT : fromOtherAgent(r) ? OTHER_AGENT : undefined;
     return {
-      id: r.id, memory: r.text, hash: md5(r.text), metadata: r.metadata ?? null, categories: r.categories ? knownCategories(r.categories) : null,
+      id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), hash: md5(r.text), metadata: r.metadata ?? null, categories: r.categories ? knownCategories(r.categories) : null,
       created_at: r.createdAt, updated_at: r.updatedAt, user_id: USER_ENTITY,
       ...(agent ? { agent_id: agent } : {}),
       ...(app ? { app_id: app } : {}),
@@ -627,7 +629,7 @@ export class Mem0Memories {
     try {
       saved = await this.graph.saveMemories(fresh.map((text, i) => {
         const metadata = input.metadata ?? moves.get(text)?.metadata;
-        return { text, ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
+        return { text, ...(input.title !== undefined && fresh.length === 1 ? { title: input.title } : {}), ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
       }), { accountId, aboutHint, topic: fresh.length || attach.length ? topic : undefined, attach });
     } catch (err) {
       // The write failed, so nothing is removed: said in the error itself.
@@ -663,7 +665,7 @@ export class Mem0Memories {
     }
     // Where each memory landed, said first among what places it: an account, a topic, or the user.
     const byAccount = new Map(accounts.map(a => [a.accountId, a.name]));
-    const result = (r: MemoryRecord, event: 'ADD' | 'UPDATE') => ({ id: r.id, memory: r.text, event, filed: filedOf(r, byAccount, saved.topic?.parent), categories: knownCategories(r.categories), rev: r.rev, topic: r.topic && shownTopic(r.topic), ...(movedFrom.has(r.id) ? { moved_from: movedFrom.get(r.id), ...(gonebefore.has(r.id) ? { older_already_removed: true } : {}) } : {}) });
+    const result = (r: MemoryRecord, event: 'ADD' | 'UPDATE') => ({ id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), event, filed: filedOf(r, byAccount, saved.topic?.parent), categories: knownCategories(r.categories), rev: r.rev, topic: r.topic && shownTopic(r.topic), ...(movedFrom.has(r.id) ? { moved_from: movedFrom.get(r.id), ...(gonebefore.has(r.id) ? { older_already_removed: true } : {}) } : {}) });
     const results = [...saved.written.map(r => result(r, 'ADD')), ...saved.attached.map(r => result(r, 'UPDATE'))];
     const rest = {
       ...(saved.topic ? { topic: { id: saved.topic.id, name: oneLine(saved.topic.name, NAME_CHARS), created: saved.topic.created, ...(saved.topic.relationDefaulted ? { relation_defaulted: true } : {}) } } : {}),
@@ -839,13 +841,14 @@ export class Mem0Memories {
   async update(id: string, change: UpdateInput) {
     const text = change.text?.trim();
     if (change.text !== undefined && !text) throw new Error('text cannot be empty; delete_memory removes a memory.');
-    if (text === undefined && change.categories === undefined && change.topic === undefined) {
-      throw new Error('update_memory needs at least one change: text, categories or topic.');
+    if (text === undefined && change.title === undefined && change.categories === undefined && change.topic === undefined) {
+      throw new Error('update_memory needs at least one change: text, title, categories or topic.');
     }
     const unknown = (change.categories ?? []).filter(c => !(MEM0_CATEGORIES as readonly string[]).includes(c));
     if (unknown.length) throw new Error(`Unknown categories: ${unknown.join(', ')}. Use mem0's: ${MEM0_CATEGORIES.join(', ')}.`);
     const edit = await this.graph.editMemory(id, {
       ...(text !== undefined ? { text } : {}),
+      ...(change.title !== undefined ? { title: change.title } : {}),
       ...(change.categories !== undefined ? { categories: change.categories } : {}),
       ...(change.topic !== undefined ? { topic: change.topic === null ? null : { topic: change.topic, type: change.topic_type, link: topicLinkOf(change.topic_link) } } : {}),
       ...(change.expected_rev !== undefined ? { expectedRev: change.expected_rev } : {}),
@@ -854,7 +857,7 @@ export class Mem0Memories {
     const topic = edit.topic === undefined ? r.topic : edit.topic;
     const { relationDefaulted, parent: _parent, ...shown } = (topic ?? {}) as TopicResult;
     return {
-      message: 'Memory updated successfully!', id: r.id, memory: r.text,
+      message: 'Memory updated successfully!', id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}),
       filed: filedOf({ ...r, topic: topic ? shown : null }, new Map(), edit.parent),
       categories: knownCategories(r.categories),
       topic: topic && { ...shownTopic(shown), ...(relationDefaulted ? { relation_defaulted: true } : {}) },
@@ -1304,7 +1307,8 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
     // mem0-mcp adds "Requires at least one: user_id, agent_id, or run_id." Not here: the user is
     // always the account owner, and agents stall guessing a user_id.
     description: 'Save one fact about the user, as you go and not only at the end of a task: a preference, a decision and why, a fact about an account, where things stand. Durable facts only, not raw attempts or working notes. ' +
-      'One memory is one fact, readable on its own, in as many sentences as it needs, with what makes it useful later: who said or decided it and when (not when saved), the reason, the status. Never secrets. ' +
+      'By default a memory is one fact, readable on its own, in as many sentences as it needs, with what makes it useful later: who said or decided it and when (not when saved), the reason, the status. Never secrets, in a page or anywhere else. ' +
+      'A page is for one subject whose facts belong together, such as a trip plan or a project: give it a `title` and use Markdown: headings, lists, tables, to-dos (`- [ ] item`), callouts (`> [!NOTE]`; also TIP, IMPORTANT, WARNING, CAUTION) and toggles (any of those five, `> [!TIP]- Title` starts closed, `+` open). Facts that stand alone stay separate memories with no title. A callout notifies nobody: tell the person anything urgent. Link to another memory with `[its name](memory:<memory_id>)` when one depends on the other, and file related memories under a topic; do neither just to do it. Someone who cannot open the linked memory sees plain words with nothing to tap, and the link gives no access or way to ask for it. A linked id that answers not found may be deleted or not open to you: do not guess; tell the person if it matters. ' +
       'Where it goes, in this order: (1) a fact about a service the user has an account for is linked to that account (app_id); (2) a fact about a subject (a project, a trip, a person, an organisation) goes under a topic: list_topics first and reuse one that fits; (3) only a fact about the user themself takes neither. app_id or topic, never both. ' +
       'The result says where each memory landed in `filed`: { under: "account" | "topic" | "user", id, name } (`parent` for a topic under another), and has `not_linked` when app_id matched no account. Adding the same text again with an app_id that matches moves that memory to the account: the linked memory is saved first, then the older one is removed (`moved_from`). ' +
       'Example, six calls, one fact each: {text: "Cabinet order placed with Example Cabinets on 2026-03-02.", app_id: "Example Cabinets", categories: ["milestones"]}; ' +
@@ -1319,6 +1323,7 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
       'Needs memory.save; without it this answers 403 INSUFFICIENT_GRANT: ask once with request_access({ permissions: ["memory.save"] }), then retry.',
     inputSchema: {
       text: z.string().describe('One fact, in as many plain sentences as it needs: readable on its own, with who said or decided it and when, the reason and the status where they matter. Required even if `messages` is provided.'),
+      title: z.string().max(400).optional().describe(MEMORY_TITLE_HELP),
       messages: z.array(z.object({ role: z.string(), content: z.string() })).optional()
         .describe('Structured conversation history with `role`/`content`. Use when you have multiple turns.'),
       user_id: z.string().optional().describe('Ignored: memories always belong to the account owner (default_user).'),
@@ -1338,7 +1343,7 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
     },
     annotations: write,
   }, guarded(changed(async (a: AddInput) => {
-    const r = await memories.add({ text: a.text, messages: a.messages, app_id: a.app_id, metadata: a.metadata, categories: a.categories,
+    const r = await memories.add({ text: a.text, title: a.title, messages: a.messages, app_id: a.app_id, metadata: a.metadata, categories: a.categories,
       topic: a.topic, topic_type: a.topic_type, topic_link: a.topic_link, supersedes: a.supersedes, confirm_new: a.confirm_new }, opts.canSample());
     if (r.results.length) opts.onSave?.();
     return r;
@@ -1387,10 +1392,11 @@ ${FILTER_EXAMPLES}
   }, guarded(async (a: { memory_id: string }) => memories.get(a.memory_id)));
 
   reg('update_memory', {
-    description: 'Change an existing memory in place (same memory_id): its text, its categories, or the topic it is filed under. The result says where the memory is in `filed`. When a fact changes (a new date, a new status), update the original here instead of adding a contradicting copy: read it, then pass its rev as expected_rev. Also use it to file a memory under a topic; never save a copy instead. You can change what you saved while you hold memory.save, and any other memory you hold memory.edit on; a topic or category you add or remove must be one you can write.',
+    description: 'Change an existing memory in place (same memory_id): its text, its title, its categories, or the topic it is filed under. The result says where the memory is in `filed`. When a fact changes (a new date, a new status), update the original here instead of adding a contradicting copy: read it, then pass its rev as expected_rev. Text is replaced whole and the owner can tick a page\'s to-dos, so re-read first, send expected_rev, and keep the ticks. Changing a box in your text is an edit like any other. Also use it to file a memory under a topic; never save a copy instead. You can change what you saved while you hold memory.save, and any other memory you hold memory.edit on; a topic or category you add or remove must be one you can write.',
     inputSchema: {
       memory_id: z.string().describe('Exact memory_id to change.'),
       text: z.string().optional().describe('Replacement text for the memory: the whole fact as it now stands, readable on its own (what changed, and when).'),
+      title: z.string().max(400).optional().describe(MEMORY_TITLE_HELP + ' An empty string removes it; leaving this out keeps it.'),
       categories: z.array(z.enum(MEM0_CATEGORIES)).optional().describe('Replaces the memory\'s categories.'),
       topic: z.string().max(200).nullable().optional()
         .describe('File it under this topic (a name or "topic:<id>"; created if you can read none by that name), or null to file it back under the user.'),

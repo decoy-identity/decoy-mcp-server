@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.4.0
+
+- **A memory can have a title.** `add_memory` and `update_memory` take an optional `title`, reads return it, and an empty string removes it. It is sealed beside the text.
+- **Memories can be pages.** A fact that stands alone stays one memory with no title. The `add_memory` description explains when a subject needs a page: a title, Markdown callouts and toggles, and links between memories (`[name](memory:<memory_id>)`). A link gives no access.
+- **`update_memory` says to re-read a page first.** Text is replaced whole and the owner can tick to-dos, so a rewrite keeps the ticks.
+
+## 1.3.2
+
+- **A read that is `preparing` no longer sends the owner to their phone.** The line a waiting read
+  prints says Decoy is already asking the owner's app, that the owner has nothing to do, and to read
+  again, for a few minutes if need be.
+- **A connection always has an icon.** A pairing that names no icon (no `DECOY_AGENT_FOR` the
+  bridge knows, no `DECOY_AGENT_ICON`, or one that is not a listed name) sends `robot`, so the
+  Decoy app shows an agent instead of the name's first letter. A configured icon is sent as before,
+  and the start-up update sends only what is configured.
+- **The bridge says when a newer release is out.** When Decoy reports a newer decoy-mcp-server,
+  `--context` prints one line after its first line, and a running bridge adds the same line after
+  one tool result per session: the newer version, this one, and the command
+  (`npx -y decoy-mcp-server@latest`, or the install's own update). Keeping the bridge current is
+  approved by the owner as part of setup, so the line says to update without asking. Nothing is
+  said when the bridge is current. Only a released version number is taken from Decoy's answer;
+  the line and its command are the bridge's own.
+- **`UPDATE_REQUIRED` says the update is approved.** Decoy refuses a bridge more than two minor
+  versions behind the latest release; the refusal gives `npx -y decoy-mcp-server@latest` and says
+  to update without asking.
+- **README: Keep the bridge current.** Start it with `npx -y decoy-mcp-server@latest`, or, on a
+  server, a systemd service with a daily restart timer, so each new release is picked up with
+  nobody stepping in.
+
 ## 1.3.1 (2026-10-27)
 
 - **Topics you can read and rearrange.** `read_topic { topic, depth? }` shows one topic with its

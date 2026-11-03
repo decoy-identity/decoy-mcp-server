@@ -3,11 +3,13 @@
  *
  * POST /api/connect takes `client_uri` (RFC 7591: the agent's https site; Decoy uses only its host
  * and shows that site's favicon) and `icon` (one Phosphor name from the server's list, shown when
- * there is no favicon). The app shows favicon, else the picked icon, else the letter.
+ * there is no favicon). The app shows favicon, else the picked icon.
  *
  * Known `DECOY_AGENT_FOR` slugs map to their site and a picked icon (KNOWN_AGENTS); any other slug
  * sends neither. DECOY_AGENT_URI (https only) and DECOY_AGENT_ICON (a listed name) override. An
  * override that is not valid is left out with a log line; the pairing goes ahead either way.
+ * A pairing that names no icon sends DEFAULT_AGENT_ICON (pairingBase only: the start-up sync sends
+ * only what is configured, so it never adds a request for a bridge with nothing set).
  */
 
 /** The Phosphor names the server accepts for `icon`: the same list as the Decoy API's
@@ -17,7 +19,7 @@ export const AGENT_ICON_NAMES = [
   'calendar', 'calendar-check', 'camera', 'car', 'chart-bar', 'chart-line', 'chat-circle', 'chat-teardrop-text',
   'check-square', 'clock', 'cloud', 'code', 'coffee', 'compass', 'cpu', 'credit-card', 'crown', 'database',
   'envelope', 'envelope-simple', 'file-text', 'film-slate', 'first-aid', 'flask', 'folder', 'fork-knife',
-  'game-controller', 'gear', 'gift', 'globe', 'graduation-cap', 'handshake', 'heart', 'heartbeat', 'house',
+  'game-controller', 'gear', 'gift', 'globe', 'golf', 'graduation-cap', 'handshake', 'heart', 'heartbeat', 'house',
   'image', 'key', 'leaf', 'lightbulb', 'lightning', 'list-checks', 'lock-key', 'magnifying-glass',
   'map-trifold', 'megaphone', 'microphone', 'music-notes', 'newspaper', 'note-pencil', 'notebook', 'package',
   'palette', 'paw-print', 'pencil-simple', 'phone', 'puzzle-piece', 'receipt', 'robot', 'rocket-launch',
@@ -26,6 +28,9 @@ export const AGENT_ICON_NAMES = [
 ] as const;
 export type AgentIconName = (typeof AGENT_ICON_NAMES)[number];
 const ICON_SET: ReadonlySet<string> = new Set(AGENT_ICON_NAMES);
+
+/** The icon a pairing sends when nothing names one, so the app never shows a letter. */
+export const DEFAULT_AGENT_ICON: AgentIconName = 'robot';
 
 /** Each known `?for=` slug: its site (whose favicon Decoy shows) and the icon shown without one. */
 export const KNOWN_AGENTS: Readonly<Record<string, { uri: string; icon: AgentIconName }>> = Object.freeze({
@@ -90,12 +95,12 @@ export function pairingBase(o: {
     agent_public_key: o.publicKeySpki,
     ...(o.clientId && { client_id: o.clientId }),
     ...(o.identity.client_uri && { client_uri: o.identity.client_uri }),
-    ...(o.identity.icon && { icon: o.identity.icon }),
+    icon: o.identity.icon ?? DEFAULT_AGENT_ICON,
   };
 }
 
 const IDENTITY_WARNINGS: Readonly<Record<string, string>> = {
-  client_uri_ignored: '[Decoy] Decoy did not use the site sent with the pairing (client_uri_ignored), so the app shows the picked icon or the letter. The pairing continues.',
+  client_uri_ignored: '[Decoy] Decoy did not use the site sent with the pairing (client_uri_ignored), so the app shows the picked icon. The pairing continues.',
   icon_ignored: '[Decoy] Decoy did not use the icon sent with the pairing (icon_ignored). The pairing continues.',
 };
 

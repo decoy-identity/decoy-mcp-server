@@ -216,7 +216,7 @@ export interface TopicResult extends TopicRef { created: boolean; relationDefaul
 /** What a writer asks for: a topic by name or `topic:<id>`; type and link apply only when it is created. */
 export interface TopicSpec { topic: string; type?: string; link?: { to?: string; relation?: string } }
 /** A change to one memory. `topic` null = back to the user; `categories` replaces the set, `addCategories` adds. */
-export interface MemoryChange { text?: string; categories?: string[]; addCategories?: string[]; topic?: TopicSpec | null; expectedRev?: number }
+export interface MemoryChange { text?: string; /** Blank clears it. */ title?: string; categories?: string[]; addCategories?: string[]; topic?: TopicSpec | null; expectedRev?: number }
 /** `parent`: the name of the topic the memory's topic hangs under, when there is one. */
 export interface MemoryEdit { record: MemoryRecord; topic?: TopicResult | null; rotated: boolean; reconciled?: boolean; parent?: string }
 
@@ -286,7 +286,19 @@ const outcomeUnknown = (id: string) => Object.assign(new Error(`Decoy did not co
 interface Opened { row: WireRow; space: SpaceInfo | null; value: Record<string, unknown>; key: Buffer }
 /** A memory about to be saved: its plaintext and the labels that decide who may read it. */
 interface NewRow { id: string; value: Record<string, unknown>; facts: Omit<MemoryFacts, 'row_id'> }
-interface NewMemory { text: string; metadata?: Record<string, unknown>; categories?: string[] }
+interface NewMemory { text: string; title?: string; metadata?: Record<string, unknown>; categories?: string[] }
+
+/** A memory's optional title, sealed beside the text. Untrusted like the text: one line, no control or direction characters, capped. */
+export function cleanMemoryTitle(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let out = raw.replace(/[\r\n\t]/g, ' ').replace(/(?!\u200D)[\p{Cc}\p{Cf}]/gu, '').split(/\s+/).filter(Boolean).join(' ');
+  if (out.length > 120) {
+    out = out.slice(0, 120).replace(/[\uD800-\uDBFF]$/, '');
+    const space = out.lastIndexOf(' ');
+    if (space > 0) out = out.slice(0, space);
+  }
+  return out || undefined;
+}
 interface Grantees {
   owner_public_key: string | null;
   grantees: { token_id: string; public_key: string; selectors: MemorySelectors }[];
@@ -298,6 +310,8 @@ interface Grantees {
 export interface MemoryRecord {
   id: string;
   text: string;
+  /** Its optional title, never read from the text. */
+  title?: string;
   entityName: string;
   accountId: string | null;
   mine: boolean;
@@ -614,7 +628,7 @@ export class ContextGraph {
     return `topic:${node.topicId}`;
   }
 
-  private static observationRow(node: { accountId: string | null; entity: { name: string } }, label: string, content: string, extra: { metadata?: Record<string, unknown>; categories?: string[]; aboutHint?: string } = {}): NewRow {
+  private static observationRow(node: { accountId: string | null; entity: { name: string } }, label: string, content: string, extra: { title?: string; metadata?: Record<string, unknown>; categories?: string[]; aboutHint?: string } = {}): NewRow {
     const categories = [...new Set(extra.categories ?? [])];
     return {
       id: randomUUID(),
@@ -622,6 +636,7 @@ export class ContextGraph {
         // An account's name is never sealed: readers resolve `account:<id>` locally.
         observation: node.accountId ? { content } : { entityName: node.entity.name, content },
         about: [label],
+        ...(extra.title ? { title: extra.title } : {}),
         ...(categories.length ? { categories } : {}),
         ...(extra.aboutHint ? { about_hint: extra.aboutHint } : {}),
         ...(extra.metadata ? { metadata: extra.metadata } : {}),
@@ -873,10 +888,11 @@ export class ContextGraph {
     const metadata = o.value.metadata && typeof o.value.metadata === 'object' ? o.value.metadata as Record<string, unknown> : undefined;
     const categories = Array.isArray(o.value.categories) ? (o.value.categories as unknown[]).filter((c): c is string => typeof c === 'string') : undefined;
     const aboutHint = typeof o.value.about_hint === 'string' && o.value.about_hint ? o.value.about_hint : undefined;
+    const title = cleanMemoryTitle(o.value.title);
     const at = o.row.created_at ?? new Date(0).toISOString();
     const about = (Array.isArray(o.value.about) ? o.value.about : []).filter((a): a is string => typeof a === 'string');
     return {
-      id: o.row.id, text: ob.content, entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
+      id: o.row.id, text: ob.content, ...(title ? { title } : {}), entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
       // A row that states no author is never taken for the owner's: this connection's own is an
       // agent's, and so is anyone else's until the server says otherwise.
       authorKind: o.row.author_kind ?? 'agent', rev: o.row.rev ?? 1,
@@ -1453,14 +1469,14 @@ export class ContextGraph {
       }
       const first = rows.length;
       for (const it of items) {
-        rows.push(ContextGraph.observationRow(node, label, it.text, { metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint }));
+        rows.push(ContextGraph.observationRow(node, label, it.text, { title: cleanMemoryTitle(it.title), metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint }));
       }
       await this.saveRows(rows);
       const now = new Date().toISOString();
       const written = rows.slice(first).map((r, i): MemoryRecord => {
         const cats = r.value.categories as string[] | undefined;
         return {
-          id: r.id, text: items[i].text, entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
+          id: r.id, text: items[i].text, ...(cleanMemoryTitle(items[i].title) ? { title: cleanMemoryTitle(items[i].title) } : {}), entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
           createdAt: now, updatedAt: now, ...(items[i].metadata ? { metadata: items[i].metadata } : {}),
           ...(cats ? { categories: cats } : {}), ...(r.value.about_hint ? { aboutHint: r.value.about_hint as string } : {}),
           topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null,
@@ -1652,6 +1668,11 @@ export class ContextGraph {
     const value: Record<string, unknown> = { ...o.value };
     const text = change.text ?? record.text;
     ob.content = text;
+    const nextTitle = change.title === undefined ? record.title : cleanMemoryTitle(change.title);
+    if (change.title !== undefined) {
+      if (nextTitle) value.title = nextTitle;
+      else delete value.title;
+    }
     const oldCats = record.categories ?? [];
     const cats = ContextGraph.nextLabels(record, change, topic).categories;
     if (change.categories || change.addCategories?.length) value.categories = cats;
@@ -1662,7 +1683,7 @@ export class ContextGraph {
     value.observation = ob;
     const newAbout = (Array.isArray(value.about) ? value.about : []).filter((a): a is string => typeof a === 'string');
     const result = (rev: number, updatedAt: string): MemoryRecord => ({
-      ...record, text, rev, updatedAt, categories: cats, about: newAbout,
+      ...record, text, ...(nextTitle ? { title: nextTitle } : { title: undefined }), rev, updatedAt, categories: cats, about: newAbout,
       ...(topic !== undefined ? { topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null, entityName: topic ? topic.name : USER_ENTITY } : {}),
     });
 

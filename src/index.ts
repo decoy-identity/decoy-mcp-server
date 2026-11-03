@@ -62,7 +62,7 @@ import { withAccessFirst, accessFingerprint, compactJson, holdsWholeAccount, per
 import { accessSeenStore, ACCESS_SEEN_FILE } from './access-seen.js';
 import { clientHeaderValue, decoyRequest } from './client-header.js';
 import { contextSeenStore, memoriesSeen, noMemoriesSeen, CONTEXT_SEEN_FILE, type ContextSeenStore } from './context-seen.js';
-import { contextText, noMemoryAccessText, sinceLastRun, firstStepLine, launchCommand, contextNotPaired, contextMisconfigured, CONTEXT_UNAVAILABLE, CONTEXT_TIMED_OUT,
+import { contextText, noMemoryAccessText, sinceLastRun, firstStepLine, bridgeUpdateLine, withUpdateLine, launchCommand, contextNotPaired, contextMisconfigured, CONTEXT_UNAVAILABLE, CONTEXT_TIMED_OUT,
   CONTEXT_REQUEST_TIMEOUT_MS, CONTEXT_DEADLINE_MS, CONTEXT_NAMES_RESERVE_MS } from './first-step.js';
 import { Mem0Memories, registerMem0Tools, parseImport, importMemories, memoryDigest, TOPIC_TOOLS, GRAPH_WRITE_TOOLS } from './mem0-tools.js';
 import { lazyMemoryEngine, BasicEngine, type MemoryEngineLike, type Sampler } from './memory-engine.js';
@@ -1066,6 +1066,8 @@ export async function memoryContextText(server: McpServer, opts: { full?: boolea
   }
   const access = policies ? withAccessFirst(policies, at).access : null;
   const ability = access ? memoryAbility(access) : null;
+  // A newer bridge is published: said after the first line, whatever else the run prints.
+  const update = bridgeUpdateLine(policies, PACKAGE_VERSION);
   const fingerprint = policies ? accessFingerprint(policies, at) : null;
   // No memory access: the run is recorded as that, and the call to ask with is given only on the
   // run that recorded it, so later runs state the fact alone.
@@ -1079,7 +1081,7 @@ export async function memoryContextText(server: McpServer, opts: { full?: boolea
         ask = opts.seen.load()?.count === null;
       }
     } catch { /* not recorded: the fact alone */ }
-    return noMemoryAccessText(ask);
+    return withUpdateLine(noMemoryAccessText(ask), update);
   };
   if (ability && !ability.read) return noAccess();
   let records: MemoryRecord[], brief: string, waiting: Waiting[];
@@ -1098,7 +1100,7 @@ export async function memoryContextText(server: McpServer, opts: { full?: boolea
   } catch { /* nothing to compare with, or nothing kept */ }
   // One line, whatever is waiting: a run prints lines an agent reads top to bottom.
   const waitingLineNow = waitingText(waiting)?.replace(/\n/g, ' ') ?? null;
-  return contextText({ brief, since, all: readsAllMemories(access), waiting: waitingLineNow, ...(opts.full ? { rules: memoryRules.get(server) ?? MEMORY_INSTRUCTIONS } : {}) });
+  return withUpdateLine(contextText({ brief, since, all: readsAllMemories(access), waiting: waitingLineNow, ...(opts.full ? { rules: memoryRules.get(server) ?? MEMORY_INSTRUCTIONS } : {}) }), update);
 }
 /** What a `--context` run reads through a server, per server. */
 const contextReaders = new WeakMap<McpServer, { policies: () => Promise<unknown>; memories: (namesBy: number) => Promise<{ records: MemoryRecord[]; brief: string; waiting: Waiting[] }> }>();
@@ -1165,6 +1167,11 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
   };
   let beforeTool: (name: string) => void = () => {};
   let afterTool: (name: string) => void = () => {};
+  // A newer bridge is published (GET /policies `bridge_update`): the line goes after one tool
+  // result, once per session.
+  let bridgeUpdate: string | null = null;
+  let bridgeUpdateSaid = false;
+  const sawPolicies = (answer: unknown) => { bridgeUpdate = bridgeUpdateLine(answer, PACKAGE_VERSION); };
   /** The tools whose arguments carry personal info to save. Nothing they answer or log repeats
    *  an argument: an error is one the bridge built from fixed strings and field names
    *  (FixedRefusal), or it is replaced by one that carries only the HTTP status and the server's
@@ -1278,6 +1285,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
           const note = MACHINE_READ_TOOLS.has(name) ? null : await memorySession.end(name, fine);
           if (fine && r && Array.isArray(r.content)) {
             if (note) r.content.push({ type: 'text', text: note });
+            if (bridgeUpdate && !bridgeUpdateSaid && !MACHINE_READ_TOOLS.has(name)) { r.content.push({ type: 'text', text: bridgeUpdate }); bridgeUpdateSaid = true; }
             if (name === 'my_permissions') {
               r.content.push({ type: 'text', text: memorySession.report() });
               const step = memorySession.firstStep();
@@ -1326,7 +1334,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
     }
     lookedOnce = true;
     accessLook = Promise.resolve().then(() => apiCall('/policies'))
-      .then((r) => { accessAnswer = r; access.seen(accessRead(r)); memorySession.sawAccess(memoryAbility(withAccessFirst(r, new Date(now())).access)); })
+      .then((r) => { accessAnswer = r; sawPolicies(r); access.seen(accessRead(r)); memorySession.sawAccess(memoryAbility(withAccessFirst(r, new Date(now())).access)); })
       .catch(() => { accessAnswer = null; memorySession.sawAccess(null); /* no answer: nothing is known, nothing is said */ })
       .finally(() => { accessLook = null; });
   };
@@ -3270,6 +3278,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
     async () => {
       const answer = await call('/policies');
       accessAnswer = answer;
+      sawPolicies(answer);
       access.read(accessRead(answer));
       const shaped = withAccessFirst(answer, new Date(now()));
       memorySession.sawAccess(memoryAbility(shaped.access));
