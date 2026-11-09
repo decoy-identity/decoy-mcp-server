@@ -30,7 +30,7 @@ import { readWithRetry, waitingText, WaitingError } from './waiting.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { DEFAULT_TOPIC_RELATION, GraphRefusal, NAME_CHARS, SUGGESTED_RELATIONS_MAX, TOPIC_TYPES, USER_ENTITY, accountSuffix, nameKey, oneLine, movingText, retryWait, shownTopic, type ContextGraph, type ListedTopic, type Entity, type MemoryRecord, type Relation, type TopicRef, type TopicResult, type TopicSpec } from './context-graph.js';
+import { DEFAULT_TOPIC_RELATION, GraphRefusal, NAME_CHARS, SUGGESTED_RELATIONS_MAX, TOPIC_TYPES, USER_ENTITY, accountSuffix, cleanMemoryTitle, nameKey, oneLine, movingText, retryWait, shownTopic, type ContextGraph, type ListedTopic, type Entity, type MemoryRecord, type Relation, type TopicRef, type TopicResult, type TopicSpec } from './context-graph.js';
 import { CLOSE_WORD_OVERLAP, MEM0_CATEGORIES, type ChatMessage, type MemoryEngineLike } from './memory-engine.js';
 import { gatedRegister } from './register-tools.js';
 import { serverSaid } from './api-error.js';
@@ -373,7 +373,10 @@ export function topicLinkOf(l: string | { to?: string; relation?: string } | und
   return typeof l === 'string' ? { relation: l } : l;
 }
 
-const MEMORY_TITLE_HELP = 'A short title, on one line, for a page: one subject whose facts belong together, such as a trip plan or a project. Leave it out for a fact that stands alone. It is separate from the text: do not repeat it as a first heading.';
+const TITLE_UNREADABLE = 'title has no readable characters. Send a title in words, or "" to remove it.';
+/** Said when a text changes beside a title that stays: the title may now say something else. */
+const titleKept = (title: string) => `The title ${JSON.stringify(title)} was kept. If it no longer fits the new text, send a new title with update_memory.`;
+const MEMORY_TITLE_HELP = 'A short title, on one line: what the memory is about, in a few words. Give every memory one; it is what the owner sees in their list. It is separate from the text: do not repeat it as a first heading.';
 
 export interface AddInput {
   text: string; title?: string; messages?: ChatMessage[]; app_id?: string; metadata?: Record<string, unknown>; categories?: string[];
@@ -566,6 +569,7 @@ export class Mem0Memories {
   private async addUnchecked(input: AddInput, canSample: boolean) {
     const unknown = (input.categories ?? []).filter(c => !(MEM0_CATEGORIES as readonly string[]).includes(c));
     if (unknown.length) throw new Error(`Unknown categories: ${unknown.join(', ')}. Use mem0's: ${MEM0_CATEGORIES.join(', ')}.`);
+    if (input.title !== undefined && input.title.trim() && !cleanMemoryTitle(input.title)) throw new Error(TITLE_UNREADABLE);
     const { items, accounts, topics } = await this.load();
     const held: { memory: string; candidates: CloseCandidate[] }[] = [];
     const flagged = new Map<string, CloseCandidate[]>();
@@ -579,7 +583,8 @@ export class Mem0Memories {
     if (input.topic !== undefined && accountId) throw new Error('A memory is about one thing: a topic or an account (app_id), not both.');
     if (input.supersedes !== undefined && input.confirm_new) throw new Error('Send exactly one of supersedes or confirm_new, not both.');
     const topic: TopicSpec | undefined = input.topic !== undefined ? { topic: input.topic, type: input.topic_type, link: topicLinkOf(input.topic_link) } : undefined;
-    const facts = input.messages?.length && canSample ? await this.engine.extractFacts(input.messages) : [input.text];
+    const fromMessages = !!(input.messages?.length && canSample);
+    const facts = fromMessages ? await this.engine.extractFacts(input.messages!) : [input.text];
     const where = { topic: input.topic, accountId, topics };
     if (input.supersedes !== undefined) return this.supersede(input, facts, items, where);
     const byHash = new Map(items.map(e => [e.item.hash, e]));
@@ -623,13 +628,20 @@ export class Mem0Memories {
         : fresh.map(() => []);
     // A memory that moves keeps its categories and its metadata.
     const tags = fresh.map((text, i) => [...new Set([...knownCategories(moves.get(text)?.categories ?? []), ...own[i]])]);
+    // A title belongs to one fact: it goes with a call that saves one new fact from `text`, never
+    // with facts drawn from `messages` (even one), where it could land on another fact than the one
+    // it names. An empty title names none. A title that is not set is said, never dropped quietly.
+    const ownTitle = input.title?.trim() && !fromMessages && facts.length === 1 ? input.title : undefined;
+    const titleNotSet = !!input.title?.trim() && !(ownTitle !== undefined && fresh.length === 1);
     const unchanged = (ids: string[]) => ids.length === 1 ? `memory ${ids[0]} is unchanged where it was` : `memories ${ids.join(', ')} are unchanged where they were`;
     const staying = [...moves].filter(([text]) => !fresh.includes(text)).map(([, r]) => r.id);
     let saved: Awaited<ReturnType<ContextGraph['saveMemories']>>;
     try {
       saved = await this.graph.saveMemories(fresh.map((text, i) => {
         const metadata = input.metadata ?? moves.get(text)?.metadata;
-        return { text, ...(input.title !== undefined && fresh.length === 1 ? { title: input.title } : {}), ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
+        // A memory that moves keeps its title too, unless this call names one.
+        const title = ownTitle ?? moves.get(text)?.title;
+        return { text, ...(title ? { title } : {}), ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
       }), { accountId, aboutHint, topic: fresh.length || attach.length ? topic : undefined, attach });
     } catch (err) {
       // The write failed, so nothing is removed: said in the error itself.
@@ -674,6 +686,7 @@ export class Mem0Memories {
       ...similarOf(saved.topic, topics, topicLinkOf(input.topic_link)?.to),
       ...(duplicates.length ? { duplicates } : {}),
       ...(skipped.length ? { skipped } : {}),
+      ...(titleNotSet ? { title_not_set: 'The title was not set: a title goes with a call that saves one fact from text as a new memory. Give a memory its title with update_memory.' } : {}),
       // The agent asked to link the memory to an account and it was not: said, so it can be put right.
       ...(aboutHint && saved.written.length ? { not_linked: `app_id ${JSON.stringify(aboutHint)} ${whyNotLinked}, so this is not linked to an account: it is saved ${saved.topic ? `under the topic ${JSON.stringify(oneLine(saved.topic.name, NAME_CHARS))}` : 'as a fact about the user'}, with that name kept as a hint. Leave this one in place: when the same text is added again with an app_id that matches, it is saved under that account and only then is this one removed. To link it, add it again with ${app?.sameName.length ? 'app_id set to the account\'s id' : app?.sameStart.length ? 'the account\'s name exactly as list_topics shows it (`accounts`), or its whole id' : 'the account\'s name exactly as list_topics shows it (`accounts`), or its id'}${saved.topic ? ', and without topic' : ''}.` } : {}),
     };
@@ -760,10 +773,11 @@ export class Mem0Memories {
     try {
       const r = await this.update(id, {
         text: texts[0], expected_rev: candidate.rev,
+        ...(input.title?.trim() ? { title: input.title } : {}),
         ...(input.categories?.length ? { categories: [...new Set([...(old.record.categories ?? []), ...input.categories])] } : {}),
       });
       this.shownRev.delete(id);
-      const results = [{ id: r.id, memory: r.memory, event: 'UPDATE' as const, filed: r.filed, categories: r.categories, rev: r.rev, topic: r.topic, superseded: true }];
+      const results = [{ id: r.id, memory: r.memory, ...(r.title ? { title: r.title } : {}), event: 'UPDATE' as const, filed: r.filed, categories: r.categories, rev: r.rev, topic: r.topic, superseded: true }];
       // The corrected memory now says what this text says. A copy of the text that this connection
       // saved (when the save was flagged, in this session or before a restart) must not stay beside
       // it. What is removed is decided from what is stored NOW, never from what was remembered:
@@ -791,6 +805,7 @@ export class Mem0Memories {
       const calls = (list: string[]) => list.map(x => `delete_memory({ memory_id: "${x}" })`).join(', ');
       return {
         results,
+        ...(r.title_kept ? { title_kept: r.title_kept } : {}),
         ...(removed.length ? { removed_copy: removed[0] } : {}),
         ...(stuck.length ? { copy_not_removed: stuck[0], next: `The older memory was corrected, but its copy could not be removed: call ${calls(stuck)}.` }
           : elsewhere.length ? { copy_not_removed: elsewhere[0], next: `The older memory was corrected. Another memory of yours says the same: if it is a copy, call ${calls(elsewhere)}.` }
@@ -841,6 +856,7 @@ export class Mem0Memories {
   async update(id: string, change: UpdateInput) {
     const text = change.text?.trim();
     if (change.text !== undefined && !text) throw new Error('text cannot be empty; delete_memory removes a memory.');
+    if (change.title !== undefined && change.title.trim() && !cleanMemoryTitle(change.title)) throw new Error(TITLE_UNREADABLE);
     if (text === undefined && change.title === undefined && change.categories === undefined && change.topic === undefined) {
       throw new Error('update_memory needs at least one change: text, title, categories or topic.');
     }
@@ -865,6 +881,7 @@ export class Mem0Memories {
       rev: r.rev, created_at: r.createdAt, updated_at: r.updatedAt,
       ...(edit.rotated ? { key_rotated: true } : {}),
       ...(edit.reconciled ? { reconciled: true } : {}),
+      ...(text !== undefined && change.title === undefined && r.title ? { title_kept: titleKept(r.title) } : {}),
     };
   }
 
@@ -1307,8 +1324,8 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
     // mem0-mcp adds "Requires at least one: user_id, agent_id, or run_id." Not here: the user is
     // always the account owner, and agents stall guessing a user_id.
     description: 'Save one fact about the user, as you go and not only at the end of a task: a preference, a decision and why, a fact about an account, where things stand. Durable facts only, not raw attempts or working notes. ' +
-      'By default a memory is one fact, readable on its own, in as many sentences as it needs, with what makes it useful later: who said or decided it and when (not when saved), the reason, the status. Never secrets, in a page or anywhere else. ' +
-      'A page is for one subject whose facts belong together, such as a trip plan or a project: give it a `title` and use Markdown: headings, lists, tables, to-dos (`- [ ] item`), callouts (`> [!NOTE]`; also TIP, IMPORTANT, WARNING, CAUTION) and toggles (any of those five, `> [!TIP]- Title` starts closed, `+` open). Facts that stand alone stay separate memories with no title. A callout notifies nobody: tell the person anything urgent. Link to another memory with `[its name](memory:<memory_id>)` when one depends on the other, and file related memories under a topic; do neither just to do it. Someone who cannot open the linked memory sees plain words with nothing to tap, and the link gives no access or way to ask for it. A linked id that answers not found may be deleted or not open to you: do not guess; tell the person if it matters. ' +
+      'By default a memory is one fact, readable on its own, in as many sentences as it needs, with what makes it useful later: who said or decided it and when (not when saved), the reason, the status. Every memory has a short `title` and neat Markdown text: a short fact is a clear paragraph or two; give longer text the shape it has (lists, bold labels, `code` for paths and commands). Never secrets, in a page or anywhere else. ' +
+      'A page is for one subject whose facts belong together, such as a trip plan or a project: use headings, lists, tables, to-dos (`- [ ] item`), callouts (`> [!NOTE]`; also TIP, IMPORTANT, WARNING, CAUTION) and toggles (any of those five, `> [!TIP]- Title` starts closed, `+` open). Facts that stand alone stay separate memories, each with its own title. A callout notifies nobody: tell the person anything urgent. Link to another memory with `[its name](memory:<memory_id>)` when one depends on the other, and file related memories under a topic; do neither just to do it. Someone who cannot open the linked memory sees plain words with nothing to tap, and the link gives no access or way to ask for it. A linked id that answers not found may be deleted or not open to you: do not guess; tell the person if it matters. ' +
       'Where it goes, in this order: (1) a fact about a service the user has an account for is linked to that account (app_id); (2) a fact about a subject (a project, a trip, a person, an organisation) goes under a topic: list_topics first and reuse one that fits; (3) only a fact about the user themself takes neither. app_id or topic, never both. ' +
       'The result says where each memory landed in `filed`: { under: "account" | "topic" | "user", id, name } (`parent` for a topic under another), and has `not_linked` when app_id matched no account. Adding the same text again with an app_id that matches moves that memory to the account: the linked memory is saved first, then the older one is removed (`moved_from`). ' +
       'Example, six calls, one fact each: {text: "Cabinet order placed with Example Cabinets on 2026-03-02.", app_id: "Example Cabinets", categories: ["milestones"]}; ' +
@@ -1322,7 +1339,7 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
       'When it creates a topic whose name looks like one you can read, `similar_topics` names those (the memory is saved all the same): file under the existing one next time. ' +
       'Needs memory.save; without it this answers 403 INSUFFICIENT_GRANT: ask once with request_access({ permissions: ["memory.save"] }), then retry.',
     inputSchema: {
-      text: z.string().describe('One fact, in as many plain sentences as it needs: readable on its own, with who said or decided it and when, the reason and the status where they matter. Required even if `messages` is provided.'),
+      text: z.string().describe('One fact (or a page), in neat Markdown, in as many sentences as it needs: readable on its own, with who said or decided it and when, the reason and the status where they matter. Do not repeat the title as a first heading. Required even if `messages` is provided.'),
       title: z.string().max(400).optional().describe(MEMORY_TITLE_HELP),
       messages: z.array(z.object({ role: z.string(), content: z.string() })).optional()
         .describe('Structured conversation history with `role`/`content`. Use when you have multiple turns.'),

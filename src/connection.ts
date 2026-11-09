@@ -182,6 +182,9 @@ export interface Connection {
    *  only ever sent with the key it was created with: a pairing that makes a new key gets a new id.
    *  A new id is written by commitPairing, never before. null for credentials from the environment. */
   clientId(): string | null;
+  /** True when the id clientId() answers was made for this pairing (a first pairing, so no
+   *  Reconnect is possible); false for a stored or pinned id, or none. */
+  clientIdIsNew(): boolean;
   /** Where things live, for messages. */
   readonly paths: { tokenFile: string; keyFile: string; clientIdFile: string; credentialsFile: string | null };
 }
@@ -281,6 +284,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     // Reconnect for a key the connection does not know.
     return (cachedClientId = storedIdForKey() ?? (idToSave = `decoy-mcp-server.${randomUUID()}`));
   };
+  const clientIdIsNew = (): boolean => { clientId(); return idToSave !== null && cachedClientId === idToSave; };
   /** ~-relative, for messages. */
   const tilde = (p: string) => (p.startsWith(opts.home) ? `~${p.slice(opts.home.length)}` : p);
   /** The same for a whole sentence, whatever produced it: the cause shown on /health and tool results never carries the home path. */
@@ -354,7 +358,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     let memory: SavedCredentials | null = null;   // a save with no file to write to: this process only
     note(first?.access_token, first?.refresh_token);
     return {
-      source: 'environment', keyPair, paths, clientId, ...notPairing,
+      source: 'environment', keyPair, paths, clientId, clientIdIsNew, ...notPairing,
       credentials: () => memory ?? readSink() ?? { access_token: envToken!, ...(envRefresh && { refresh_token: envRefresh }) },
       // The credentials file is bound to this key and these tokens (readSink refuses any other), so what it holds is this connection's.
       adoptable: (failedBearer) => {
@@ -438,7 +442,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       return now;
     };
     return {
-      source: 'credentials-file', keyPair: first.keyPair, paths, clientId, ...notPairing,
+      source: 'credentials-file', keyPair: first.keyPair, paths, clientId, clientIdIsNew, ...notPairing,
       credentials: () => {
         if (memory) return memory;
         const now = current();
@@ -515,7 +519,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     }
     info(`[Decoy] Using the access token from ${E.accessToken} with the agent key in ${keyFile}. It carries no refresh token and is not renewed.`);
     return {
-      source: 'environment-token', keyPair: keyForEnv, paths, clientId, ...notPairing,
+      source: 'environment-token', keyPair: keyForEnv, paths, clientId, clientIdIsNew, ...notPairing,
       credentials: () => ({ access_token: envToken }),
       canRenew: () => false,
       save: () => { /* an explicit token is used as given */ },
@@ -826,7 +830,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   };
 
   const files = {
-    paths, clientId, adoptable, known, retrySave,
+    paths, clientId, clientIdIsNew, adoptable, known, retrySave,
     unsaved: () => (memory ? unsavedWhy : null),
     credentials: () => memory ?? readSaved()?.credentials ?? null,
     canRenew: () => !!(memory ?? readSaved()?.credentials)?.refresh_token,

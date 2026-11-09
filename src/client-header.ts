@@ -5,6 +5,11 @@
 //   X-Decoy-Client: decoy-mcp-server/1.2.3
 //   X-Decoy-Client: decoy-mcp-server/1.2.3; mode=context
 //   X-Decoy-Client: decoy-mcp-server/1.2.3; mode=call
+//   X-Decoy-Client: decoy-desktop-extension/1.2.3
+//
+// The last is the same bridge packed as a Claude Desktop extension (mcpb/pack.mjs). It has a name
+// of its own because it is updated by installing a new bundle, not with npx: Decoy's update notice
+// and version floor for decoy-mcp-server name npx, and do not apply to it.
 //
 // That is all it says. Nothing about the machine, the user, the host application or the session
 // is ever put in it, and no other identifying header is added. It goes to the API host this bridge
@@ -15,9 +20,10 @@
 
 export const CLIENT_HEADER = 'X-Decoy-Client';
 export const CLIENT_NAME = 'decoy-mcp-server';
+export const EXTENSION_CLIENT_NAME = 'decoy-desktop-extension';
 
-export function clientHeaderValue(version: string, mode?: 'context' | 'call'): string {
-  return `${CLIENT_NAME}/${version}${mode ? `; mode=${mode}` : ''}`;
+export function clientHeaderValue(version: string, mode?: 'context' | 'call', name: string = CLIENT_NAME): string {
+  return `${name}/${version}${mode ? `; mode=${mode}` : ''}`;
 }
 
 /** The same request with the client header set (a header of that name already there is replaced). */

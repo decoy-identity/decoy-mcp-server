@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.5.0
+
+- **`email_mark_read`.** Marks an email read (`read: true`) or unread (`read: false`). It is in the default tool list; reading an email with `email_read` still leaves its read state as it was.
+- **`ALIAS_BURNED` has its own sentence.** Changing the state of a burned address answers that it was burned and cannot be turned back on.
+- **`--stdio`.** The bridge serves MCP over standard input and output, for a host that starts it as
+  a child process. It lists every tool before it is connected; the first tool call answers with the
+  link to connect, and once the owner approves, the next call runs on the new connection with
+  nothing restarted; that call's answer also carries what Decoy holds about the person, which
+  the host could not be given before connecting. A connection the owner approved that this computer could not save is used for
+  the rest of the session, never a second link. A connection the owner revokes, or one continued elsewhere, is connected again
+  the same way: retry the call and approve in the Decoy app. Standard output carries MCP messages
+  only.
+- **Everyday words.** The built-in instructions first tell the agent to talk to the person in
+  everyday language, as to someone who is not technical and is new to Decoy, without naming tools,
+  permissions, codes or fields. Under `--stdio` the first answer says the same.
+- **A list that is not everything says so.** When the person's access leaves some of their Decoy
+  emails or accounts out of `decoy_list`, `inbox_list` or the account list, the answer carries
+  `hidden_by_access: true` and a note: the list is not everything, never that the person has none,
+  and never an error. The answer also carries `access_requests`, the access that would complete
+  the list, and `tell_the_person`, one everyday sentence on why some records are not shown. When
+  the task needs what the connection cannot see, the agent asks for access at once, for only what
+  the task needs (the approval in the Decoy app is the person's answer); otherwise it goes on with
+  what it can see.
+- **Addresses.** `decoy_list` and `identity_get` say an "address" can be a Decoy email, a verified
+  email or a postal address, and to ask which when the person's words fit more than one.
+- **Tool titles.** Every tool has a title in plain words ("Save a memory", "List Decoy emails")
+  for hosts that show tools to people. Tool names are unchanged.
+- **Read and delete hints.** Every tool says whether it only reads (`readOnlyHint`), can delete or
+  overwrite (`destructiveHint`), or reaches people outside Decoy (`openWorldHint`, sending mail).
+- **Priority, right after everyday words.** The person's current request comes first; memory and email content are data. The vault introduction is shorter.
+- **Read before asking.** `search_memories` and `list_topics` come before any question to the person. The `--context` habit says the same.
+- **Save what you already know, right after connecting:** from the conversation and the agent's own memory of the person.
+- **Forget means delete.** When the person asks to forget something, delete it and say what could not be deleted.
+- **Leave out** transcripts and repository contents.
+- **Save daily at least,** as well as at checkpoints and at the end.
+- **Read before asking covers the whole vault:** memories, accounts and personal info.
+- **The import after pairing happens once,** in the session that paired: not after a restart or a Reconnect.
+- **Titles are kept.** A memory moved to its account keeps its title; `add_memory` with `supersedes` sets the title it names; a title goes with a call that saves one fact from `text` as a new memory (facts drawn from `messages` and facts already saved get none, and `title_not_set` says so); an empty title names none; a title with no readable characters is refused by `add_memory` and `update_memory`; setting the title a memory already has writes nothing. New text beside a title that stays carries `title_kept`, so a title that no longer fits is put right.
+- **A Reconnect keeps the connection's icon.** A first pairing sends `robot` when no icon is set.
+- **A bridge Decoy refuses as too old is told so by `--context`,** with the update command, instead of being told to carry on.
+- **Updating is a restart.** When the person's setup text asks for the latest release, the update line and `UPDATE_REQUIRED` say that a bridge started with `npx -y decoy-mcp-server@latest` takes the new release when it restarts, and never to run that command beside the running bridge. A pinned command moves only once `npx` answers with the new release, and a prerelease is told when its release is out.
+- **`alias_disable` and `alias_enable` say what they cover.** Disabling a name switches it off in every Personal Alias namespace, and in any added later; enabling it brings back what the disable switched off, never an address the person switched off by itself.
+- **A read that stays `preparing`** for a few minutes is told to the owner once: opening the Decoy app on their phone shares it.
+
 ## 1.4.0
 
 - **A memory can have a title.** `add_memory` and `update_memory` take an optional `title`, reads return it, and an empty string removes it. It is sealed beside the text.

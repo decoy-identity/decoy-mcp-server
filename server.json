@@ -8,7 +8,7 @@
     "url": "https://github.com/decoy-identity/decoy-mcp-server",
     "source": "github"
   },
-  "version": "1.4.0",
+  "version": "1.5.0",
   "icons": [
     {
       "src": "https://www.decoys.me/apple-touch-icon.png",
@@ -23,7 +23,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "decoy-mcp-server",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "streamable-http",

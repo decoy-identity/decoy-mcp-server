@@ -10,6 +10,7 @@
 // token (the bridge does that), so a token Decoy refuses is the "could not be read" line.
 
 import type { ContextSeen } from './context-seen.js';
+import { PLAIN_VERSION, UPDATE_COMMAND } from './api-error.js';
 
 /** The time budget of a whole `--context` run, counted from the start of its process: the run has
  *  printed by then, whatever Decoy did. A hook waits for the run as a whole, so the whole is what
@@ -26,7 +27,7 @@ export const CONTEXT_NAMES_RESERVE_MS = 500;
 
 export const CONTEXT_LEAD = 'Decoy holds what is known about this person. Reading this is the first step of every task, including tasks with no login.';
 export const CONTEXT_HABITS = [
-  'Before you start: read what is saved (search_memories for the subject of the task, and list_topics).',
+  'Before you start, and before asking the person: read what is saved (search_memories for the subject of the task, and list_topics).',
   'As you work: save lasting facts as they come up (add_memory), each linked to the account or topic it belongs to.',
 ] as const;
 /** Said only by a connection that reads all memories: for any other, nothing it can read is all that is known. */
@@ -65,25 +66,32 @@ export const firstStepCommand = (version: string, local?: string | null) => (loc
 export const firstStepLine = (version: string, local?: string | null) =>
   `Decoy first step: no run of it is recorded on this machine. At the start of every task, run \`${firstStepCommand(version, local)}\` and read its output; put that command in a session-start hook or in your standing notes.`;
 
-/** What updates the bridge to the latest release with no prompt; an install of its own has its own update. */
-export const BRIDGE_UPDATE_COMMAND = 'npx -y decoy-mcp-server@latest';
-const RELEASE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-const core = (v: string): number[] | null => { const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:[-+].*)?$/.exec(v); return m ? [1, 2, 3].map(i => Number(m[i])) : null; };
+/** A version's three numbers, and whether it is a prerelease (`-rc.1`); build metadata (`+x`) counts for nothing. */
+const core = (v: string): { n: number[]; pre: boolean } | null => {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})(-[^+]*)?(?:\+.*)?$/.exec(v);
+  return m ? { n: [1, 2, 3].map(i => Number(m[i])), pre: !!m[4] } : null;
+};
 /** One line when Decoy says a newer bridge is published (GET /policies `bridge_update`), else null.
  *  The line is the bridge's own: only a well-formed released version newer than this one is taken
- *  from the answer, never its text or command. The owner pre-approved keeping the bridge current
- *  (decoys.me agent-guidance.json `update_policy`), so the line says to update without asking. */
+ *  from the answer, never its text or command. The line grants nothing: it says to update when the
+ *  person's own setup text asks for the bridge to be kept current, and otherwise to tell the person. */
 export function bridgeUpdateLine(answer: unknown, running: string): string | null {
   const u = answer && typeof answer === 'object' ? (answer as { bridge_update?: unknown }).bridge_update : null;
   const latest = u && typeof u === 'object' ? (u as { latest_version?: unknown }).latest_version : null;
-  if (typeof latest !== 'string' || !RELEASE.test(latest)) return null;
+  if (typeof latest !== 'string' || !PLAIN_VERSION.test(latest)) return null;
   const mine = core(running);
   const theirs = core(latest)!;
   if (!mine) return null;
-  const newer = theirs[0] - mine[0] || theirs[1] - mine[1] || theirs[2] - mine[2];
+  // A release is newer than its own prerelease (1.4.1 after 1.4.1-rc.1).
+  const newer = theirs.n[0] - mine.n[0] || theirs.n[1] - mine.n[1] || theirs.n[2] - mine.n[2] || (mine.pre ? 1 : 0);
   if (newer <= 0) return null;
-  return `decoy-mcp-server ${latest} is available (this bridge is ${mine.join('.')}). The owner pre-approved keeping it current: ` +
-    `update now, without asking, with \`${BRIDGE_UPDATE_COMMAND}\` (or your install's own update) and move any command pinned to an older version to ${latest}, then restart the bridge; the saved connection is kept.`;
+  const shown = /^[\w.+-]{1,40}$/.test(running) ? running : mine.n.join('.');
+  // The version is Decoy's word, so a pin moves only once npm itself answers with that release.
+  // The start command is not an update: it runs a bridge, so the update is a restart.
+  return `decoy-mcp-server ${latest} is available (this bridge is ${shown}). If the person's setup text asks you to keep the bridge on its latest release, update it: ` +
+    `a bridge started with \`${UPDATE_COMMAND}\` takes the new release when it restarts: restart it, and never run that command beside the running bridge (it starts a second one). ` +
+    `An install with its own update: use that. A start command pinned to a version: change it to ${latest} only once \`npx -y decoy-mcp-server@${latest} --version\` answers ${latest}, then restart. ` +
+    `The saved connection is kept. Otherwise, tell the person that ${latest} is out and give them that command.`;
 }
 /** The --context output with the update line after its first line. */
 export const withUpdateLine = (text: string, line: string | null): string => {

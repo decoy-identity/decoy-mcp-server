@@ -8,8 +8,10 @@
  * Known `DECOY_AGENT_FOR` slugs map to their site and a picked icon (KNOWN_AGENTS); any other slug
  * sends neither. DECOY_AGENT_URI (https only) and DECOY_AGENT_ICON (a listed name) override. An
  * override that is not valid is left out with a log line; the pairing goes ahead either way.
- * A pairing that names no icon sends DEFAULT_AGENT_ICON (pairingBase only: the start-up sync sends
- * only what is configured, so it never adds a request for a bridge with nothing set).
+ * A first pairing that names no icon sends DEFAULT_AGENT_ICON (pairingBase only: the start-up sync sends
+ * only what is configured, so it never adds a request for a bridge with nothing set). A pairing with a
+ * stored client_id may be a Reconnect, which keeps the connection's stored icon unless the pairing names
+ * one, so it sends no default; an id made for this pairing (`newClientId`) is a first pairing.
  */
 
 /** The Phosphor names the server accepts for `icon`: the same list as the Decoy API's
@@ -72,7 +74,7 @@ export function agentIdentity(env: Env): AgentIdentity {
     if (ICON_SET.has(icon)) id.icon = icon as AgentIconName;
     else {
       delete id.icon;
-      id.notes.push('[Decoy] DECOY_AGENT_ICON is not one of the icon names Decoy lists, so no icon is sent with the pairing.');
+      id.notes.push(`[Decoy] DECOY_AGENT_ICON is not one of the icon names Decoy lists, so it is left out: a first pairing shows ${DEFAULT_AGENT_ICON}, and a Reconnect keeps the connection's icon.`);
     }
   }
   return id;
@@ -88,6 +90,8 @@ function isHttpsSite(raw: string): boolean {
 /** Who is pairing, in the body of POST /api/connect: the asks are added by pairingRequestBody (index.ts). */
 export function pairingBase(o: {
   name: string; publicKeySpki: string; clientId?: string | null; identity: AgentIdentity;
+  /** The client id was made for this pairing: a first pairing, never a Reconnect. */
+  newClientId?: boolean;
 }): Record<string, unknown> {
   return {
     name: o.name,
@@ -95,7 +99,7 @@ export function pairingBase(o: {
     agent_public_key: o.publicKeySpki,
     ...(o.clientId && { client_id: o.clientId }),
     ...(o.identity.client_uri && { client_uri: o.identity.client_uri }),
-    icon: o.identity.icon ?? DEFAULT_AGENT_ICON,
+    ...(o.identity.icon ? { icon: o.identity.icon } : o.clientId && !o.newClientId ? {} : { icon: DEFAULT_AGENT_ICON }),
   };
 }
 

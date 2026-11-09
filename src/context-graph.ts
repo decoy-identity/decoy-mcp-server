@@ -1476,7 +1476,7 @@ export class ContextGraph {
       const written = rows.slice(first).map((r, i): MemoryRecord => {
         const cats = r.value.categories as string[] | undefined;
         return {
-          id: r.id, text: items[i].text, ...(cleanMemoryTitle(items[i].title) ? { title: cleanMemoryTitle(items[i].title) } : {}), entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
+          id: r.id, text: items[i].text, ...(r.value.title ? { title: r.value.title as string } : {}), entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
           createdAt: now, updatedAt: now, ...(items[i].metadata ? { metadata: items[i].metadata } : {}),
           ...(cats ? { categories: cats } : {}), ...(r.value.about_hint ? { aboutHint: r.value.about_hint as string } : {}),
           topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null,
@@ -1575,6 +1575,7 @@ export class ContextGraph {
         const now = this.recordsOf(await this.load()).find(r => r.id === id);
         const landed = now && now.rev > record.rev
           && (change.text === undefined || now.text === change.text)
+          && (change.title === undefined || now.title === cleanMemoryTitle(change.title))
           && (topic === undefined || (now.topic?.id ?? null) === (topic?.id ?? null));
         if (!landed) throw outcomeUnknown(id);
         return { record: now, rotated: false, reconciled: true, ...(topic !== undefined ? { topic } : {}), ...(parent ? { parent } : {}) };
@@ -1670,6 +1671,9 @@ export class ContextGraph {
     ob.content = text;
     const nextTitle = change.title === undefined ? record.title : cleanMemoryTitle(change.title);
     if (change.title !== undefined) {
+      // Setting the title it already has, and nothing else: no write, no new revision.
+      const titleOnly = change.text === undefined && !change.categories && !change.addCategories?.length && topic === undefined;
+      if (titleOnly && nextTitle === record.title) return { record, rotated: false };
       if (nextTitle) value.title = nextTitle;
       else delete value.title;
     }
@@ -1683,7 +1687,7 @@ export class ContextGraph {
     value.observation = ob;
     const newAbout = (Array.isArray(value.about) ? value.about : []).filter((a): a is string => typeof a === 'string');
     const result = (rev: number, updatedAt: string): MemoryRecord => ({
-      ...record, text, ...(nextTitle ? { title: nextTitle } : { title: undefined }), rev, updatedAt, categories: cats, about: newAbout,
+      ...record, text, title: nextTitle, rev, updatedAt, categories: cats, about: newAbout,
       ...(topic !== undefined ? { topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null, entityName: topic ? topic.name : USER_ENTITY } : {}),
     });
 

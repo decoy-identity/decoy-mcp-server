@@ -57,7 +57,7 @@ const KIND_WORDS: Record<WaitingKind, string> = {
 };
 /** The bridge's own sentence for each state. */
 const STATE_SENTENCE: Record<WaitingState, string> = {
-  preparing: 'They are saved, and Decoy is already asking the owner\'s Decoy app to share them; the owner has nothing to do. Do not report them as missing, and do not ask the owner to open the app. Read again after the retry time, for a few minutes if need be.',
+  preparing: 'They are saved, and Decoy is already asking the owner\'s Decoy app to share them; the owner has nothing to do yet. Do not report them as missing. Read again after the retry time, for a few minutes if need be; if they are still waiting after that, tell the owner once that opening the Decoy app on their phone shares them.',
   failed: 'They are saved, and this connection cannot open them until the owner\'s Decoy app shares them. Do not report them as missing, and do not retry.',
   unavailable: 'They are saved, and this connection cannot open them. Do not report them as missing, and do not retry.',
   unknown: 'They are saved, and this connection cannot open them. Do not report them as missing.',

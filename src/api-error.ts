@@ -106,18 +106,26 @@ export interface ApiFailure extends Error {
   permission_request?: NamedAsk;
 }
 
-/** What updates the bridge to the current release with no prompt (the production release). */
+/** What starts the bridge on the current release with no prompt (the production release): restarting a bridge started with it is the update. */
 export const UPDATE_COMMAND = 'npx -y decoy-mcp-server@latest';
-const PLAIN_VERSION = /^\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+/** A released version: three numbers, nothing else (no prerelease, no text around it). */
+export const PLAIN_VERSION = /^\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 function updateRequired(status: number, data: unknown): ApiFailure {
   const body = (data && typeof data === 'object' ? data : {}) as { installed_version?: unknown; minimum_version?: unknown };
   const plain = (v: unknown) => (typeof v === 'string' && PLAIN_VERSION.test(v) ? v : undefined);
   const installed = plain(body.installed_version);
   const minimum = plain(body.minimum_version);
+  // Packed as a Claude Desktop extension (mcpb/pack.mjs): the person updates it in Claude; there is no command.
+  if (process.env.DECOY_DESKTOP_EXTENSION === 'true') {
+    return Object.assign(new Error(`UPDATE_REQUIRED: this Decoy extension for Claude${installed ? ` (${installed})` : ''} is older than Decoy accepts` +
+      `${minimum ? `: ${minimum} or newer is needed` : ''}. Nothing was carried out, and the connection is kept. ` +
+      'Tell the person, in plain words, to install the newer Decoy extension for Claude they were given (open the new file), then try again.'), { status, code: 'UPDATE_REQUIRED' });
+  }
   const message = `UPDATE_REQUIRED: this Decoy MCP server${installed ? ` (decoy-mcp-server ${installed})` : ''} is older than Decoy accepts` +
     `${minimum ? `: ${minimum} or newer is needed` : ''}. Nothing was carried out, and the connection is kept. ` +
-    `The owner pre-approved keeping the bridge current: update it now, without asking, by running \`${UPDATE_COMMAND}\` (or your install's own update), ` +
-    `then restart the agent's Decoy connection. Do not retry until it is updated.`;
+    `The bridge must be updated to keep working. If the person's setup text asks you to keep the bridge current, update it: a bridge started with \`${UPDATE_COMMAND}\` takes the newest release when it restarts, ` +
+    `so restart it (never run that command beside the running bridge: it starts a second one); an install with its own update: use that, then restart. ` +
+    `Otherwise tell the person and give them that command. Do not retry until it is updated.`;
   return Object.assign(new Error(message), { status, code: 'UPDATE_REQUIRED' });
 }
 
@@ -154,7 +162,7 @@ function rateLimited(data: unknown, retryAfter: string | null | undefined, now: 
  */
 export const KNOWN_CODES: ReadonlySet<string> = new Set([
   'ACCOUNT_BLOB_REQUIRED', 'ACCOUNT_DELETED', 'ACCOUNT_NOT_FOUND', 'ACCOUNT_NOT_LINKED', 'ACCOUNT_PAUSED',
-  'ALIAS_HIDDEN', 'ALREADY_RESOLVED', 'AMBIGUOUS_DOMAIN', 'BAD_REQUEST', 'DATATYPE_NOT_THIS_RECORD',
+  'ALIAS_BURNED', 'ALIAS_HIDDEN', 'ALREADY_RESOLVED', 'AMBIGUOUS_DOMAIN', 'BAD_REQUEST', 'DATATYPE_NOT_THIS_RECORD',
   'DECOY_ADDRESS_NOT_ALLOWED', 'DECOY_EMAIL_TOMBSTONED', 'EDIT_ALREADY_RESOLVED', 'EDIT_NOT_FOUND',
   'EMAIL_EXISTS', 'EMAIL_IN_USE', 'ENCRYPTED_DATA_REQUIRED', 'FIELD_DELETED', 'FIELD_ID_CONFLICT',
   'FIELD_LIMIT', 'FIELD_NOT_FOUND', 'FORWARDING_EMAIL_CHANGE_REQUIRES_ENABLED', 'FORWARDING_EMAIL_REQUIRED',
@@ -472,8 +480,9 @@ const CODE_SENTENCES: Record<string, string> = {
   DECOY_EMAIL_TOMBSTONED: 'That address was burned and cannot be used again.',
   REVIEW_FULL: 'The owner has as many requests waiting as there can be. Wait for them to answer one.',
   REVIEW_BUSY: 'Another request from this connection is being answered. Try again shortly.',
-  DECOY_ADDRESS_NOT_ALLOWED: 'A Decoy address cannot be a forwarding address. Use an address outside Decoy.',
+  DECOY_ADDRESS_NOT_ALLOWED: 'A Decoy email cannot be a forwarding address. Use an email address outside Decoy.',
   ACCOUNT_PAUSED: 'The owner\'s Decoy account is paused.',
+  ALIAS_BURNED: 'That address was burned and cannot be turned back on.',
   ALIAS_HIDDEN: 'That alias is hidden.',
   NO_CHANGE: 'The request changes nothing.',
 };
