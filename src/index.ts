@@ -544,18 +544,24 @@ const PERSONAL_DATA_SHAPES = {
     label: z.string().optional().describe('Optional label'),
   }),
 } as const;
-// What the bridge asks for when it connects: three permissions in one
-// approval, "Add accounts to Decoy", "Save new memories" and "Read all memories", so every agent
-// shares one memory from day one. The scopes they need come with them (the server derives them
-// from the rows). The owner may narrow or add to them on the approval screen; anything else is
-// asked for later with request_access on the same connection.
+// What the bridge asks for when it connects, in one approval: "Add accounts to Decoy", "Save new
+// memories" and "Read all memories", so every agent shares one memory from day one, and the reads
+// the tools clearly need: every account's Decoy email (acctmail.read) and the Personal Alias
+// addresses (alias.read), so a question about the person's addresses needs no second approval
+// (the person approves as few times as possible). The same five as the hosted connector. Account details
+// (account.read: passwords, codes, cards) and anything that sends, edits, deletes or burns wait
+// for a task that needs them, asked for in one request_access. The scopes come with the rows (the
+// server derives them). The owner may narrow or add to them on the approval screen.
 const RAR = 'https://decoys.me/oauth/types/unlock';
 export const MCP_REQUESTED_DETAILS = [
   { type: RAR, permissions: ['account.create'] },
   { type: RAR, permissions: ['memory.save'] },
   { type: RAR, permissions: ['memory.read'] },
+  { type: RAR, permissions: ['acctmail.read'] },
+  { type: RAR, permissions: ['alias.read'] },
 ];
-/** The same three in the older form, for a Decoy server that answers NAMED_PERMISSIONS_UNAVAILABLE. */
+/** The first three in the older form, for a Decoy server that answers NAMED_PERMISSIONS_UNAVAILABLE
+ *  (it has no rows for an account's email or Personal Alias: those are asked for when a task needs them). */
 export const MCP_REQUESTED_DETAILS_OLDER = [
   { type: RAR, kind: 'account', actions: ['create'] },
   { type: RAR, kind: 'memory', actions: ['create'] },
@@ -1053,9 +1059,9 @@ export interface ServerDeps {
 // drop buried conditional ones). prepareMemoryInstructions() puts a summary of what's known about
 // the user above this at connect.
 /** After a list Decoy narrowed by access (`hidden_by_access`): what the agent says instead of "none". */
-export const HIDDEN_BY_ACCESS_NOTE = 'This connection cannot see all of the person\'s records here, so this list is not everything, never that they have none, and never call it an error or a bug: Decoy keeps records private until the person shares them. ' +
+export const HIDDEN_BY_ACCESS_NOTE = 'Some of the person\'s records here are not shared with this connection. When the task does not need them, say nothing about them: do not mention them, do not offer to get them, and answer with what you can see. ' +
   'When the task needs records this connection cannot see, ask for access now with request_access, without first asking the person whether to. access_requests names the permissions that would show them, for every record of that kind: send what the task needs, narrowed to one account (account_id) or one Personal Alias (namespace_id) when it needs only that one; with none, ask for what the task needs. The approval in the Decoy app is their answer, and request_access\'s answer says what to tell them. ' +
-  'When the task does not need them, go on with what you can see. If the person asks what is missing, or a list still says this after an approval, tell them in your own words what tell_the_person says.';
+  'This list is not everything: never tell the person they have none, and never call it an error or a bug, since Decoy keeps records private until the person shares them. tell_the_person is only for when the person asks what is missing, or a list still says this after an approval: then tell them in your own words what it says.';
 /** The page as Decoy sent it, with the note when access left something out. */
 const withHiddenNote = <T extends Record<string, unknown>>(page: T): T =>
   (page?.hidden_by_access === true ? { ...page, note: HIDDEN_BY_ACCESS_NOTE } : page);
@@ -1101,7 +1107,7 @@ ACCOUNTS, MAIL AND SECRETS:
 
 PERMISSIONS:
 - At the start of each session and when a call is refused, call my_permissions: its first lines say in plain words what you can do, by permission name, and when access ends. Work from that, not from what you asked for.
-- ASK FOR THE MINIMUM, BY NAME: the permissions and the one account, alias or category the task needs (request_access), not the whole vault; you can ask for more later.
+- ASK ONCE PER TASK: everything the task needs in one request (request_access), not one permission at a time; narrowed to the one account, alias or category it needs, never the whole vault.
 - USE WHAT YOU WERE GRANTED: The owner's approval is the source of truth. Whatever they granted is yours to use for their tasks, including access you did not ask for (they can add to a request as well as narrow it). Never warn the owner about extra access or suggest narrowing it; they chose it.
 
 RESPONSE FORMAT: every tool returns one text block of JSON; a note from the bridge is a separate block after it. List tools paginate via 'pagination.next_cursor', passed back as 'cursor'.`;
@@ -2486,7 +2492,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
 
   // ── Decoy management ────────────────────────────────────────────────────────
 
-  reg('decoy_list', 'List the person\'s Decoy emails: each account\'s Decoy email, and their Personal Alias addresses when this connection may read them (alias.read). List every one unless the person asks for fewer. Filtering, sorting and pagination as below. ' +
+  reg('decoy_list', 'List the person\'s Decoy emails: each account\'s Decoy email, and their Personal Alias addresses when this connection may read them (alias.read). Addresses only: a Personal Alias\'s own subdomain is not one and is not listed. List every one unless the person asks for fewer. Filtering, sorting and pagination as below. ' +
     '"address" can mean a Decoy email, a verified email or a postal address: when the person\'s words fit more than one, ask which first. ' +
     'Returns { decoys: [{ id, service_name, service_url, decoy_email, decoy_email_hash, account_id, status, forward_enabled, agent_label, created_at, updated_at }], pagination: { next_cursor } }. ' +
     'decoy_email is the address itself (e.g. sample.alias.1@example.com). service_name/service_url are decrypted here (null when this connection holds no key for that decoy). Any stored password lives on the linked account (account_id). ' +
@@ -2514,7 +2520,10 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
     if (created_after) params.set('created_after', created_after);
     if (created_before) params.set('created_before', created_before);
     const page = await call(`/decoys?${params}`) as { decoys?: Record<string, unknown>[] } & Record<string, unknown>;
-    return ok(withHiddenNote({ ...page, decoys: await Promise.all((page.decoys ?? []).map(nameDecoy)) }));
+    // A Personal Alias root is the record behind a personal subdomain, not an address: Decoy's list
+    // leaves it out, and so does this one when a Decoy server without that change still sends it.
+    const addresses = (page.decoys ?? []).filter((d) => d.is_subdomain_root !== true);
+    return ok(withHiddenNote({ ...page, decoys: await Promise.all(addresses.map(nameDecoy)) }));
   });
 
   reg('decoy_get', 'Get a single decoy identity by ID. ' +
@@ -3456,7 +3465,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
     'Never ask the person whether you may ask: send it; their approval in the Decoy app is their answer. ' +
     'Send { permissions: [names], one selection, reason }. Names: accounts account.create (alone), account.read, account.edit, account.delete; an account\'s Decoy email acctmail.read, acctmail.mark, acctmail.send, acctmail.edit, acctmail.delete; memories about an account acctmem.read, acctmem.edit, acctmem.delete; Personal Alias alias.read, alias.mark, alias.send, alias.edit, alias.delete, alias.burn; personal info personal.read, personal.edit, personal.delete; memories memory.read, memory.save (alone), memory.edit, memory.delete; everything (alone). ' +
     'Selection, one per call (none = all of that kind): account.*, acctmail.*, acctmem.* take account_id (from credential_get with no arguments), or for account.* a domain when you know the site and not the id; alias.* take namespace_id; personal.* take record_type (identities | emails | cards) and/or personal_id; memory.* take datatypes (categories) or about (topic names or "topic:<id>"). One call may mix account.*, acctmail.* and acctmem.* on one account_id. Several targets: one call each; they join one request the owner sees together. ' +
-    'What a name needs (edit needs read, and so on) is added for you: the answer\'s `permissions` is the whole set the owner sees. Ask only for what the task needs. ' +
+    'What a name needs (edit needs read, and so on) is added for you: the answer\'s `permissions` is the whole set the owner sees. Ask for everything the task needs in one request, not one permission at a time and nothing it does not need. ' +
     'Account details do not bring their email or memories: to read a sign-in code sent to an account\'s Decoy email, ask { permissions: ["account.read","acctmail.read"], account_id }. ' +
     'What you create (accounts, addresses) you read, edit and send from without asking; deleting it needs account.delete, and burning a Personal Alias address alias.burn. ' +
     'memory.save lets you save, and read and edit what you saved while you hold it; other memories need memory.read (by category or topic); deleting needs memory.delete. Personal info is Read or No access: personal.read reads the record; cards: { permissions: ["personal.read"], record_type: "cards" }. ' +

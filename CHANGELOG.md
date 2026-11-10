@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.1
+
+- **Connecting asks for the reads the tools need.** Besides `account.create`, `memory.save` and
+  `memory.read`, the one approval at connect now asks for `acctmail.read` (Read all accounts’
+  email) and `alias.read` (Personal Alias: Read email), so asking about your Decoy emails needs no
+  second approval. Account details (passwords, codes, cards) and anything that sends, edits,
+  deletes or burns are still asked for when a task needs them. The instructions and
+  `request_access` tell the agent to ask for everything a task needs in one request, not one
+  permission at a time.
+- **Only real addresses in `decoy_list`.** A Personal Alias's own subdomain is not an address, so
+  it is not listed.
+- **Nothing said about records a task does not need.** When access leaves some of the person's
+  records out of a list and the task does not need them, the agent answers with what it can see
+  and does not mention or offer to get the rest.
+
 ## 1.5.0
 
 - **`email_mark_read`.** Marks an email read (`read: true`) or unread (`read: false`). It is in the default tool list; reading an email with `email_read` still leaves its read state as it was.
