@@ -15,6 +15,8 @@
 // are missing, `createMemoryEngine` falls back to word-overlap search and exact-match dedupe.
 
 import { ensurePinnedModel } from './model-pin.js';
+import { withEmbeddingCache, type EmbeddingCache } from './embedding-cache.js';
+import { MEMORY_CATEGORIES, CATEGORY_GUIDE } from './memory-categories.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,17 +48,14 @@ export interface MemoryEngineLike {
   close?(): Promise<void>;
 }
 
-/** mem0's default memory categories (docs.mem0.ai, custom categories: "Default Categories"). */
-export const MEM0_CATEGORIES = [
-  'personal_details', 'family', 'professional_details', 'sports', 'travel', 'food', 'music',
-  'health', 'technology', 'hobbies', 'fashion', 'entertainment', 'milestones', 'user_preferences', 'misc',
-] as const;
+/** The memory categories (memory-categories.ts): mem0's defaults plus finance, goals and relationships. */
+export const MEM0_CATEGORIES = MEMORY_CATEGORIES;
 
 /** Ask a model for mem0 categories: one list per memory, only names from mem0's list. */
 export async function categorizeWith(sample: Sampler, texts: string[]): Promise<string[][]> {
   if (!texts.length) return [];
   const system = `You tag memories about a user with categories. Use only these category names: ${MEM0_CATEGORIES.join(', ')}. ` +
-    'A memory can have one or more categories; use misc only when nothing else fits. ' +
+    'A memory can have one or more categories; use misc only when nothing else fits. ' + CATEGORY_GUIDE + ' ' +
     'Answer with JSON only: {"categories": [[...], ...]}, one list per memory, in order.';
   const user = texts.map((t, i) => `${i + 1}. ${t}`).join('\n');
   try {
@@ -77,6 +76,8 @@ export async function categorizeWith(sample: Sampler, texts: string[]): Promise<
 export type Sampler = (messages: ChatMessage[]) => Promise<string>;
 
 const words = (s: string) => s.toLowerCase().split(/\W+/).filter(w => w.length > 1);
+/** Words too common to say what a text is about (the word-matching search leaves them out of a query). */
+const COMMON_WORDS = new Set(('a an and are as at be but by can could do does did for from had has have how if in into is it its me my of on or our should so than that the their them then there these they this to too us was we were what when where which who why will with would you your i am want need first just also about any some all more most other such only own same very').split(' '));
 
 /** With the basic engine, two memories are close when they share at least this part of their
  *  distinct words (words in both / words in either). */
@@ -87,9 +88,16 @@ export class BasicEngine implements MemoryEngineLike {
   private texts = new Map<string, string>();
   async mirror(records: { id: string; text: string }[]) { this.texts = new Map(records.map(r => [r.id, r.text])); }
   async search(query: string, topK: number) {
-    const q = new Set(words(query));
-    return [...this.texts].map(([id, t]) => ({ id, score: words(t).filter(w => q.has(w)).length / Math.max(1, q.size) }))
-      .filter(h => h.score > 0).sort((a, b) => b.score - a.score).slice(0, topK);
+    // The share of the query's own words a memory holds (each word once; common words left out),
+    // lowered for a long text, so a page that repeats common words never outranks the short fact.
+    const q = new Set(words(query).filter(w => !COMMON_WORDS.has(w)));
+    if (!q.size) return [];
+    return [...this.texts].map(([id, t]) => {
+      const mine = words(t);
+      const held = new Set(mine.filter(w => q.has(w))).size;
+      const length = 1 + Math.log10(Math.max(1, mine.length / 50));
+      return { id, score: held / q.size / length, size: mine.length };
+    }).filter(h => h.score > 0).sort((a, b) => b.score - a.score || a.size - b.size).slice(0, topK).map(({ id, score }) => ({ id, score }));
   }
   async nearest(text: string) {
     const norm = (s: string) => words(s).join(' ');
@@ -135,7 +143,7 @@ function releaseMem0Dir(): void {
 /** mem0's Memory, local. `sample` answers mem0's extraction prompt (MCP sampling). */
 export class Mem0Engine implements MemoryEngineLike {
   private byRow = new Map<string, { mem0Id: string; text: string }>();
-  private constructor(private memory: any, private sampler: { current?: Sampler }, private model: any, private holdsDir = false) {}
+  private constructor(private memory: any, private sampler: { current?: Sampler }, private model: any, private holdsDir = false, private cache?: EmbeddingCache) {}
 
   /** onnxruntime aborts the process if it exits with a live session, so release it first. */
   async close() {
@@ -144,7 +152,7 @@ export class Mem0Engine implements MemoryEngineLike {
     try { await model?.session?.release?.(); } finally { if (holdsDir) releaseMem0Dir(); }
   }
 
-  static async create(opts: { sample?: Sampler; modelDir?: string } = {}): Promise<Mem0Engine> {
+  static async create(opts: { sample?: Sampler; modelDir?: string; cache?: EmbeddingCache } = {}): Promise<Mem0Engine> {
     const holdsDir = acquireMem0Dir();
     try {
       const modelDir = opts.modelDir ?? join(homedir(), '.decoy', 'models');
@@ -155,10 +163,12 @@ export class Mem0Engine implements MemoryEngineLike {
       await ensurePinnedModel(modelDir); // pinned commit, SHA-256 verified; fastembed skips present files
       const model = await FlagEmbedding.init({ model: EmbeddingModel.BGESmallENV15, cacheDir: modelDir });
       const collect = async (gen: AsyncIterable<number[][]>) => { const out: number[][] = []; for await (const batch of gen) out.push(...batch); return out; };
-      const embeddings = {
+      const fromModel = {
         embedQuery: async (text: string) => Array.from(await model.queryEmbed(text)) as number[],
         embedDocuments: async (texts: string[]) => (await collect(model.passageEmbed(texts))).map(v => Array.from(v)),
       };
+      // Vectors kept between runs (src/embedding-cache.ts): a new process embeds only what is new.
+      const embeddings = opts.cache ? withEmbeddingCache(fromModel, opts.cache) : fromModel;
       const memory = new Memory({
         embedder: { provider: 'langchain', config: { model: embeddings } },
         vectorStore: { provider: 'memory', config: { collectionName: 'decoy', dbPath: ':memory:', dimension: 384 } },
@@ -174,7 +184,7 @@ export class Mem0Engine implements MemoryEngineLike {
         },
         generateChat: async (messages: ChatMessage[]) => ({ content: await sampler.current!(messages), role: 'assistant' }),
       };
-      return new Mem0Engine(memory, sampler, model, holdsDir);
+      return new Mem0Engine(memory, sampler, model, holdsDir, opts.cache);
     } catch (err) {
       if (holdsDir) releaseMem0Dir(); // never leave the shared dir claimed by an engine that never existed
       throw err;
@@ -193,6 +203,10 @@ export class Mem0Engine implements MemoryEngineLike {
   }
 
   private async mirrorNow(records: { id: string; text: string }[]) {
+    try { await this.mirrorRows(records); } finally { this.cache?.flush(new Set(records.map(r => r.text))); }
+  }
+
+  private async mirrorRows(records: { id: string; text: string }[]) {
     const want = new Map(records.map(r => [r.id, r.text]));
     for (const [rowId, held] of this.byRow) {
       if (want.get(rowId) === held.text) continue;
@@ -256,11 +270,20 @@ export class Mem0Engine implements MemoryEngineLike {
 
 /** An engine created on first use, so the bridge starts without loading the model.
  *  DECOY_MEMORY_ENGINE=basic skips mem0 (no model download). */
-export function lazyMemoryEngine(opts: { sample?: Sampler; modelDir?: string } = {}): MemoryEngineLike {
+export function lazyMemoryEngine(opts: { sample?: Sampler; modelDir?: string; cache?: EmbeddingCache;
+  /** Use the embedding model only when the kept vectors hold every memory (a run with a short time
+   *  budget, such as a prompt hook): otherwise compare words this time, and say so with onCacheMiss. */
+  requireCached?: boolean; onCacheMiss?: () => void } = {}): MemoryEngineLike {
   let made: Promise<MemoryEngineLike> | null = null;
   const get = () => (made ??= process.env.DECOY_MEMORY_ENGINE === 'basic' ? Promise.resolve(new BasicEngine(opts.sample)) : createMemoryEngine(opts));
   return {
-    mirror: async (records) => (await get()).mirror(records),
+    mirror: async (records) => {
+      if (!made && opts.requireCached && (!opts.cache || records.some((r) => !opts.cache!.get(r.text)))) {
+        made = Promise.resolve(new BasicEngine(opts.sample));
+        try { opts.onCacheMiss?.(); } catch { /* a convenience */ }
+      }
+      return (await get()).mirror(records);
+    },
     search: async (query, topK) => (await get()).search(query, topK),
     nearest: async (text) => (await get()).nearest(text),
     similar: async (text, topK) => {
@@ -277,7 +300,7 @@ export function lazyMemoryEngine(opts: { sample?: Sampler; modelDir?: string } =
 }
 
 /** mem0's engine if its optional packages are installed, otherwise the basic one. */
-export async function createMemoryEngine(opts: { sample?: Sampler; modelDir?: string } = {}): Promise<MemoryEngineLike & { setSampler?: (s: Sampler | undefined) => void }> {
+export async function createMemoryEngine(opts: { sample?: Sampler; modelDir?: string; cache?: EmbeddingCache } = {}): Promise<MemoryEngineLike & { setSampler?: (s: Sampler | undefined) => void }> {
   try { return await Mem0Engine.create(opts); } catch (err) {
     // Missing optional packages are expected; a model that failed to download or verify is said.
     if (/embedding model/.test((err as Error)?.message ?? '')) console.error('[Decoy] Memory search uses the basic engine:', (err as Error).message);

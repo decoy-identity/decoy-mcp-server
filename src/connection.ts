@@ -32,11 +32,19 @@
  * never when a token exists: a new key is one the connection doesn't know, so nothing sealed to
  * the agent could be opened.
  *
+ * Every source is held to the same key (refusedKey): an RSA key of 2048, 3072 or 4096 bits with
+ * exponent 65537, the RSA keys with a key id. This bridge makes 2048-bit keys with exponent 65537. A
+ * key of any other kind or size, in the environment, the credentials file or the key file, is refused
+ * for what it is, never used. A --logout reads any private key, from every source: the connection is
+ * revoked from its tokens, and the key only finds its records.
+ *
  * No message or log line built here contains a secret: they name variables and files only.
  */
+// key-format: key-id
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, randomBytes } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, randomBytes, type KeyObject } from 'node:crypto';
+import { keyIdFromSpki } from './key-format.js';
 import { readSecretFile, writeSecretFile, writeSecretFileIn, readSecretFileIn, removeLeftoverTemps, withFileLock, LOCK_STALE_MS, LockError, type NotHeld, SecretFileError, SecretDirError } from './secret-file.js';
 import { parseSavedCredentials, parseKeyFile, serializeCredentials, savedKeyFingerprint, isTokenShaped, type AgentKeyPair, type SavedCredentials } from './credentials.js';
 import { DEFAULT_API_URL } from './api-config.js';
@@ -56,6 +64,8 @@ const UNCHANGED = 'Nothing was changed.';
 const CLIENT_ID_OK = /^[A-Za-z0-9._:-]{1,128}$/;
 const GENERATED_CLIENT_ID = /^decoy-mcp-server\.[0-9a-f-]{36}$/;
 const sha256 = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
+/** The way back from an RSA key of another size or exponent in the environment or a credentials file. */
+const logoutWayBack = (set: string) => `To end its connection, run \`npx decoy-mcp-server --logout\` with ${set} set, and then pair again: that is a new connection`;
 const PRODUCTION_HOST = new URL(DEFAULT_API_URL).host;
 
 /** How long a renewal request may take. Well inside the lock's stale threshold (secret-file
@@ -75,8 +85,9 @@ export function keyFingerprint(pair: AgentKeyPair): string {
   return sha256(Buffer.from(publicKeyOf(pair.privateKeyPem), 'base64'));
 }
 
-/** The key pair for a PKCS#8 DER private key in base64 (one line). Never echoes the value. */
-export function keyPairFromPkcs8(base64: string): AgentKeyPair {
+/** The key pair for a PKCS#8 DER private key in base64 (one line). Never echoes the value.
+ *  `logout`: any private key is read (OpenConnectionOptions.logout). */
+export function keyPairFromPkcs8(base64: string, logout = false): AgentKeyPair {
   const name = CONNECTION_ENV.key;
   const text = base64.trim();
   const shape = `${name} is not a PKCS#8 DER private key in base64 (one line, no PEM header)`;
@@ -89,8 +100,15 @@ export function keyPairFromPkcs8(base64: string): AgentKeyPair {
     // The parser's own message is dropped on purpose: only the variable is named.
     throw new CredentialSetupError(`${shape}. ${UNCHANGED}`);
   }
-  if (key.asymmetricKeyType !== 'rsa') throw new CredentialSetupError(`${name} must be an RSA key (the one this connection was paired with). ${UNCHANGED}`);
-  if ((key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new CredentialSetupError(`${name} must be an RSA key of at least 2048 bits. ${UNCHANGED}`);
+  const refused = refusedKey(key, logout);
+  if (refused === 'other') {
+    throw new CredentialSetupError(key.asymmetricKeyType !== 'rsa'
+      ? `${name} must be an RSA key (the one this connection was paired with). ${UNCHANGED}`
+      : `${name} must be an RSA key of at least 2048 bits. ${UNCHANGED}`);
+  }
+  if (refused === 'rsa') {
+    throw new CredentialSetupError(`${name} must be an RSA key of 2048, 3072 or 4096 bits with exponent 65537. ${logoutWayBack('these variables')}. ${UNCHANGED}`);
+  }
   return {
     publicKeySpki: (createPublicKey(key).export({ type: 'spki', format: 'der' }) as Buffer).toString('base64'),
     privateKeyPem: key.export({ type: 'pkcs8', format: 'pem' }) as string,
@@ -206,6 +224,9 @@ export interface OpenConnectionOptions {
   hooks?: { afterTempWrite?: (file: string) => void; beforeTokenRename?: () => void };
   /** How long to wait for another bridge's renewal (tests shorten it). */
   lock?: { waitMs?: number; staleMs?: number; pollMs?: number };
+  /** --logout: any private key is read, from every source (refusedKey), so the connection it belongs
+   *  to is revoked and its records are removed. */
+  logout?: boolean;
 }
 
 const val = (env: Record<string, string | undefined>, name: string): string | undefined => {
@@ -303,7 +324,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
 
   // ── Environment: a complete set ──────────────────────────────────────────────────────────────
   if (fromEnvironment) {
-    const keyPair = keyPairFromPkcs8(envKey!);
+    const keyPair = keyPairFromPkcs8(envKey!, opts.logout);
     const fingerprint = keyFingerprint(keyPair);
     const tokenHash = sha256(envToken!);
     const refuseFile = (why: string): never => {
@@ -410,14 +431,22 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       if (typeof p.privateKeyPem !== 'string' || !p.privateKeyPem) {
         return refuse(`it holds no agent key (privateKeyPem). A file with tokens only is used together with ${E.key} and ${E.accessToken}`);
       }
+      const NOT_RSA = 'its privateKeyPem is not an RSA private key of at least 2048 bits in PEM';
       let keyPair: AgentKeyPair;
+      let refused: ReturnType<typeof refusedKey>;
       try {
         const key = createPrivateKey(p.privateKeyPem);
-        if (key.asymmetricKeyType !== 'rsa' || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error('not this connection\'s kind of key');
+        refused = refusedKey(key, opts.logout);
         keyPair = { publicKeySpki: (createPublicKey(key).export({ type: 'spki', format: 'der' }) as Buffer).toString('base64'), privateKeyPem: key.export({ type: 'pkcs8', format: 'pem' }) as string };
       } catch {
         // The parser's own message is dropped on purpose: only the field is named.
-        return refuse('its privateKeyPem is not an RSA private key of at least 2048 bits in PEM');
+        return refuse(NOT_RSA);
+      }
+      // Outside the try: these refusals say what the key is, and are never replaced by the one above.
+      if (refused === 'other') return refuse(NOT_RSA);
+      if (refused === 'rsa') {
+        return refuse('its privateKeyPem is an RSA key this bridge does not use: a connection key is an RSA key of 2048, 3072 or 4096 bits with exponent 65537. ' +
+          logoutWayBack(E.credentialsFile));
       }
       const issuedBy = typeof p.api_host === 'string' && p.api_host ? p.api_host : PRODUCTION_HOST;
       if (issuedBy !== apiHost) return refuse(`it belongs to ${issuedBy}, and this bridge is set to ${apiHost}`);
@@ -499,12 +528,21 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   const readKey = (file: string): AgentKeyPair | null => {
     const raw = read(file);
     if (raw === null) return null;
-    try { const { privateKeyPem } = parseKeyFile(raw); return { privateKeyPem, publicKeySpki: publicKeyOf(privateKeyPem) }; }
+    let pair: AgentKeyPair;
+    try { const { privateKeyPem } = parseKeyFile(raw); pair = { privateKeyPem, publicKeySpki: publicKeyOf(privateKeyPem) }; }
     catch {
       throw new CredentialSetupError(`The agent key file ${file} is unreadable (damaged or incomplete). Restore it from a backup. Without one, run ` +
         '`npx decoy-mcp-server --logout` and then pair again: that is a new connection, and what the old connection created and was given stays with the old ' +
         `connection. ${UNCHANGED}`);
     }
+    // The same key the other sources must hold (refusedKey). Checked outside the try, so this refusal is never reported as a damaged file.
+    // A --logout reads it whatever it is: the way back this refusal names works.
+    if (refusedKey(pair.privateKeyPem, opts.logout)) {
+      throw new CredentialSetupError(`The agent key file ${file} holds a key this bridge never makes: a connection key is an RSA key of 2048, 3072 or 4096 bits ` +
+        'with exponent 65537. Restore the key file from a backup. Without one, run `npx decoy-mcp-server --logout` and ' +
+        `then pair again: that is a new connection. ${UNCHANGED}`);
+    }
+    return pair;
   };
 
   // The long-standing DECOY_AGENT_TOKEN: an access token from the environment with the key file
@@ -846,4 +884,24 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   }
   // Nothing saved, or a --reconnect: the next step is a pairing.
   return { source: 'none', keyPair: savedKey, ...files, reconnecting, keyPairForPairing, commitPairing, abandonPairing };
+}
+
+/**
+ * The one key rule, for every source: a connection key is an RSA key of 2048, 3072 or 4096 bits with
+ * exponent 65537 (the RSA keys with a key id). What a refused key is: 'rsa' for an RSA key of at least
+ * 2048 bits of another size or exponent, 'other' for any other key, or a text that is not a private
+ * key; null for a key that is used. Under --logout (`logout`) every key is used, unchecked: the
+ * connection is revoked from its tokens, and the key only finds its records.
+ */
+function refusedKey(key: KeyObject | string, logout: boolean | undefined): 'rsa' | 'other' | null {
+  if (logout) return null;
+  let k: KeyObject;
+  try { k = typeof key === 'string' ? createPrivateKey(key) : key; } catch { return 'other'; }
+  if (k.asymmetricKeyType !== 'rsa' || (k.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) return 'other';
+  return hasKeyId(createPublicKey(k).export({ type: 'spki', format: 'der' }) as Buffer) ? null : 'rsa';
+}
+
+/** Whether this key has a key id: a P-256 key, or an RSA key of 2048, 3072 or 4096 bits with exponent 65537. */
+function hasKeyId(spki: Buffer): boolean {
+  try { keyIdFromSpki(spki); return true; } catch { return false; }
 }

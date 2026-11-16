@@ -32,6 +32,12 @@ export function resolveApiConfig(env: Record<string, string | undefined>): ApiCo
   return { agentApiUrl: raw.replace(/\/$/, ''), connectFrontendUrl: connect || DEFAULT_CONNECT_URL, apiHost: url.host, isProduction };
 }
 
+// key-format: pairing-qr
+//
+// The bridge's hand-off link (the pairing-qr format): https://decoys.me/connect?code=CODE&for=…
+// in production, the page's own query kept. It writes no kid and no v (a reader takes a link with no
+// v as version 1).
+
 /** The pairing page link: the page's own query is kept; code and agent are set safely. */
 export function pairingPageUrl(connectFrontendUrl: string, code: string, agentFor: string): string {
   const u = new URL(connectFrontendUrl);

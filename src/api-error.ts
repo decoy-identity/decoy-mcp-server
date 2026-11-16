@@ -33,6 +33,7 @@
  * nothing was carried out. The command is this bridge's own text, never the server's.
  */
 import { FixedRefusal } from './scrub.js';
+import { MEMORY_CATEGORIES } from './memory-categories.js';
 import { entityOf, namedAskProblem, SELECTION_KEYS, type NamedAsk } from './permission-names.js';
 
 /**
@@ -90,7 +91,7 @@ export interface ApiFailure extends Error {
   required_scope?: string;
   /** The action a 403 INSUFFICIENT_GRANT says the refused request needed, when it is one this bridge knows. */
   request_action?: string;
-  /** false when the server says this access cannot be requested (the owner grants it when connecting the agent). */
+  /** false when the server says this access cannot be requested (the owner changes this connection's access in the Decoy app; never pair again). */
   can_request?: false;
   /** On a 403 for a read that named no kind: the secret kinds this connection's grant on that
    *  account does cover. Name ONE of them per read; do not ask for access. */
@@ -211,8 +212,7 @@ export const KNOWN_HINTS: ReadonlySet<string> = new Set([
 /** Kinds of data an ask may be narrowed to: account secret kinds, memory categories, personal info types. */
 const ASK_DATATYPES: ReadonlySet<string> = new Set([
   ...ACCOUNT_SECRET_KINDS,
-  'personal_details', 'family', 'professional_details', 'sports', 'travel', 'food', 'music', 'health', 'technology', 'hobbies', 'fashion',
-  'entertainment', 'milestones', 'user_preferences', 'misc',
+  ...MEMORY_CATEGORIES,
   'email', 'phone', 'card', 'address', 'name', 'birthday',
 ]);
 /** The actions an ask for each kind may name (the same list the Decoy API checks). */
@@ -589,7 +589,7 @@ export function apiFailure(status: number, data: unknown, retryAfter?: string | 
     message = `${said} This is an account's Decoy email: it goes only with its account, and an agent does not burn, replace or rotate it on its own. ` +
       `Leave it as it is, or delete the whole account with its email (DELETE /accounts/${acct ?? '<account id>'}, the credential_delete tool; it needs account.delete).`;
   } else if (body.error === 'access_denied' || code === 'INSUFFICIENT_GRANT') {
-    message = `Access denied: no grant on this connection covers this${code ? ` (${code})` : ''}.${cannotRequest ? ' This access cannot be requested by an agent; the owner grants it when connecting the agent.' : ''}`;
+    message = `Access denied: no grant on this connection covers this${code ? ` (${code})` : ''}.${cannotRequest ? " This access cannot be requested by an agent; the owner can change this connection's access in the Decoy app. Pairing again makes a new connection and does not help." : ''}`;
   } else if (code === 'SCOPE_MISSING') {
     message = scope === 'account.passkey_assert' && status === 403
       // Passkey sign-in is never asked for alone: it comes with Read on the account.

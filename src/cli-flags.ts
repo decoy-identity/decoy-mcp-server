@@ -37,7 +37,7 @@ export function helpText(version: string): string {
     '                    the arguments are one JSON object, `-` for standard input, or @file',
     '  tools [<tool>]    list the tools and their arguments, or one tool whole',
     '  --json            with call or tools: print JSON instead of text',
-    '',
+    '  hook <event>      a coding host\'s lifecycle hook: session-start, prompt, stop, pre-tool (--host)',
     'Documentation: https://decoys.me/documentation',
     '',
   ].join('\n');

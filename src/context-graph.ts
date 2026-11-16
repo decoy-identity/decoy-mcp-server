@@ -1,6 +1,6 @@
 // Context: the official MCP Memory server knowledge graph, stored end-to-end encrypted in
-// Decoy (docs/CONTEXT_KEY_PROTOCOL.md, docs/ACCESS_V2_MEMORY_PLAN.md). This module is the
-// reference server's KnowledgeGraphManager with the JSONL file swapped for encrypted rows:
+// Decoy. This module is the reference server's KnowledgeGraphManager with the JSONL file swapped
+// for encrypted rows:
 //
 //   - same nine operations, same inputs, same results, same error text
 //     (modelcontextprotocol/servers, src/memory/index.ts)
@@ -302,7 +302,7 @@ export function cleanMemoryTitle(raw: unknown): string | undefined {
 interface Grantees {
   owner_public_key: string | null;
   grantees: { token_id: string; public_key: string; selectors: MemorySelectors }[];
-  /** This connection's own reach: its own wrap is kept for the read reasons it holds (saving gives none). */
+  /** This connection's own reach: its own wrap carries the read reasons it holds, beside the `self` the server adds. */
   self?: { token_id: string; selectors: MemorySelectors };
 }
 
@@ -673,7 +673,7 @@ export class ContextGraph {
           ciphertext: this.deps.sealVault({ v: 2, row_id: r.id, ...r.value }, key),
           owner_wrap: sealEnvelopeForOwner(key.toString('base64'), keys.owner_public_key!),
           self_wrap: wrapKeyForRecipient(key, this.deps.ownPublicKey),
-          // Kept for the read reasons this connection holds on it now; saving alone gives none.
+          // The read reasons this connection holds on it now; the server adds `self` to its own wrap.
           ...(keys.self ? { self_via: viaForSelectors(keys.self.selectors, facts) } : {}),
           grantee_wraps: keys.grantees.flatMap(t => {
             const via = viaForSelectors(t.selectors, facts);
@@ -1734,7 +1734,9 @@ export class ContextGraph {
         for (const h of e.missing as { token_id?: unknown; public_key?: unknown; via?: unknown }[]) {
           if (typeof h?.token_id !== 'string' || typeof h.public_key !== 'string' || !Array.isArray(h.via)) continue;
           // Never a removed label, whatever the answer names: a holder left with no reason gets no new key.
-          const via = h.via.filter((v): v is string => typeof v === 'string' && v !== 'self' && !removed.includes(v)
+          // `self` is kept: the server names it only for a key of the memory's saver while the saver
+          // holds Save memories (access v3), and keeps it only for such a key.
+          const via = h.via.filter((v): v is string => typeof v === 'string' && !removed.includes(v)
             && !(v.startsWith('and:') && v.slice(4).split('+').some(x => removed.includes(x))));
           if (!via.length) continue;
           const at = wraps.findIndex(x => x.token_id === h.token_id);

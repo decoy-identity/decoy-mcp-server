@@ -1,7 +1,8 @@
 // Access v2 — who reaches each memory, and why (`via`): the bridge's port of the Decoy
 // API's rule, proven on the same golden vectors.
 //
-//   self          not a reason: access is exactly the grant, so saving a memory gives no access to it
+//   self          not a grant reason (never returned here): the server keeps a memory's saver its own
+//                 by `self` while it holds Save memories, and names it so on a new key
 //   all           a memory grant with no selector
 //   category:<c>  a memory grant on one of that observation's mem0 categories (one reason per granted category)
 //   topic:<id>    a memory grant on that topic: observations about it, the topic (entity) itself,

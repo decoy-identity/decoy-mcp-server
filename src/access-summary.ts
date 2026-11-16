@@ -31,6 +31,7 @@
 // Pure functions: no network, no clock but the one passed in.
 
 import { createHash } from 'node:crypto';
+import { MEMORY_CATEGORIES } from './memory-categories.js';
 
 type Row = Record<string, unknown>;
 type Kind = 'account' | 'message' | 'personal' | 'memory';
@@ -443,8 +444,7 @@ function sections(sentence: unknown): { parts: Array<{ label: string; text: stri
  */
 const REACHES = new Set(['all', 'some', 'created_by_you', 'all_account_inboxes', 'none']);
 const MEMORY_REACHES = new Set(['all', 'some', 'own_only', 'none']);
-const MEMORY_CATEGORIES = new Set(['personal_details', 'family', 'professional_details', 'sports', 'travel', 'food', 'music', 'health', 'technology',
-  'hobbies', 'fashion', 'entertainment', 'milestones', 'user_preferences', 'misc']);
+const MEMORY_CATEGORY_SET: ReadonlySet<string> = new Set(MEMORY_CATEGORIES);
 const DATE_TIME = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2})?)?$/;
 /** One kind's sentence from Decoy's `can`: each verb at the reach given, the count on the widest. */
 function areaWords(area: unknown, verbs: readonly string[], noun: { one: string; many: string; prep: string }): string {
@@ -461,7 +461,7 @@ export function renderAccess(given: unknown): string[] {
   const access = onePersonalRead(given);
   const m = isObj(access.memories) ? access.memories : null;
   const by = m && isObj(m.by) ? m.by : {};
-  const categories = strings(by.categories).filter(c => MEMORY_CATEGORIES.has(c));
+  const categories = strings(by.categories).filter(c => MEMORY_CATEGORY_SET.has(c));
   const whole = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n > 0;
   const reaches = [categories.length ? `categories: ${categories.join(', ')}` : '',
     whole(by.topics) ? plural(by.topics, 'topic', 'topics') : '',
@@ -525,7 +525,7 @@ export function heldPermissionsLine(response: unknown, now: Date = new Date()): 
     if (!names.length) continue;
     const id = (k: string) => (typeof row[k] === 'string' && UUID.test(row[k] as string) ? row[k] as string : null);
     const about = strings(row.about).filter(t => /^(topic|account):([0-9a-f-]{36}|\*)$/i.test(t));
-    const cats = strings(row.datatypes).filter(c => MEMORY_CATEGORIES.has(c) || ['identity', 'phone', 'address', 'email', 'credit-card'].includes(c));
+    const cats = strings(row.datatypes).filter(c => MEMORY_CATEGORY_SET.has(c) || ['identity', 'phone', 'address', 'email', 'credit-card'].includes(c));
     const target = [
       id('account_id') ? `account ${id('account_id')}` : '', id('namespace_id') ? `Personal Alias ${id('namespace_id')}` : '',
       typeof row.domain === 'string' && /^[a-z0-9.-]{1,253}$/i.test(row.domain) ? `site ${row.domain}` : '',
@@ -688,7 +688,7 @@ function accessValues(a: Row): Row {
     out.memories = {
       ...(typeof m.save === 'boolean' ? { save: m.save } : {}),
       ...Object.fromEntries(['read', 'write', 'delete'].filter(k => typeof m[k] === 'string' && MEMORY_REACHES.has(m[k] as string)).map(k => [k, m[k]])),
-      ...(by ? { by: { categories: strings(by.categories).filter(c => MEMORY_CATEGORIES.has(c)), topics: int(by.topics) ?? 0, accounts: by.accounts === 'all' ? 'all' : int(by.accounts) ?? 0 } } : {}),
+      ...(by ? { by: { categories: strings(by.categories).filter(c => MEMORY_CATEGORY_SET.has(c)), topics: int(by.topics) ?? 0, accounts: by.accounts === 'all' ? 'all' : int(by.accounts) ?? 0 } } : {}),
     };
   }
   for (const k of ['ends_at', 'updated_at']) if (a[k] === null || (typeof a[k] === 'string' && DATE_TIME.test(a[k] as string))) out[k] = a[k];

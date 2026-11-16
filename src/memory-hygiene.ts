@@ -88,6 +88,11 @@ export class MemorySession {
   private briefDone: Promise<void> = Promise.resolve();
   private readNudged = false;
   private saveNudged = false;
+  /** A memory read came before any other work: any tool of this server but a memory tool or
+   *  my_permissions (a look at the connection's own access, which agents are told to take first). */
+  private readFirst = false;
+  /** A tool that is other work has run. */
+  private didOtherWork = false;
   private firstStepSaid = false;
   private toldLoading = false;
   private ability: MemoryAbility | null = null;
@@ -95,6 +100,9 @@ export class MemorySession {
   private readonly firstAbility = new Promise<MemoryAbility | null>((resolve) => { this.abilityKnown = resolve; });
 
   constructor(private readonly opts: {
+    /** A listed hosted connector: nothing is ever added after a result (no summary, no reminder,
+     *  no first-step line); the session's numbers are still counted. */
+    quiet?: boolean;
     /** The summary (empty when there are no memories). Called at most once. */
     brief: () => Promise<string>;
     waitMs?: number;
@@ -110,6 +118,7 @@ export class MemorySession {
     this.brief = i.brief; this.toldLoading = i.toldLoading;
     this.readNudged = i.readNudged; this.saveNudged = i.saveNudged; this.firstStepSaid = i.firstStepSaid;
     this.links = i.links ?? 0;
+    this.didOtherWork = i.otherCalls > 0;
   }
 
   /** connect_topics wrote one more link in this session. */
@@ -126,7 +135,7 @@ export class MemorySession {
    *  a connection that cannot read memories. It goes with the summary sent with the first result,
    *  or after my_permissions, whichever comes first. */
   firstStep(): string | null {
-    if (this.firstStepSaid) return null;
+    if (this.firstStepSaid || this.opts.quiet) return null;
     // The first step reads memories: a connection that cannot read them is not told to set it up.
     if (this.ability && !this.ability.read) return null;
     let line: string | null = null;
@@ -149,8 +158,13 @@ export class MemorySession {
   /** A tool is about to run. */
   begin(tool: string): void {
     this.toolCalls++;
-    if (!MEMORY_TOOLS.has(tool)) this.otherCalls++;
+    if (!MEMORY_TOOLS.has(tool)) {
+      this.otherCalls++;
+      if (tool !== 'my_permissions') this.didOtherWork = true;
+    }
+    if (MEMORY_READ_TOOLS.has(tool) && !this.didOtherWork) this.readFirst = true;
     if (this.brief !== 'not_started') return;
+    if (this.opts.quiet) { this.brief = 'not_sent'; return; }
     // An agent whose first act is to read memory needs no summary pushed at it.
     if (MEMORY_READ_TOOLS.has(tool)) { this.brief = 'not_sent'; return; }
     this.brief = 'loading';
@@ -165,6 +179,7 @@ export class MemorySession {
   /** A tool has answered. Returns the one line (or the summary) to put after its result, if any. */
   async end(tool: string, ok: boolean): Promise<string | null> {
     if (!ok) return null;
+    if (this.opts.quiet) { if (MEMORY_READ_TOOLS.has(tool)) this.reads++; return null; }
     if (MEMORY_READ_TOOLS.has(tool)) {
       this.reads++;
       // It read memory itself before the summary was ready or promised: nothing to push.
@@ -199,6 +214,12 @@ export class MemorySession {
       return SAVE_NUDGE;
     }
     return null;
+  }
+
+  /** What this session did with memory, for the counts-only record (src/usage-report.ts). */
+  usage(): { toolCalls: number; reads: number; saves: number; readBeforeOther: boolean; summarySent: boolean; readNudged: boolean; saveNudged: boolean } {
+    return { toolCalls: this.toolCalls, reads: this.reads, saves: this.saves, readBeforeOther: this.readFirst,
+      summarySent: this.brief === 'delivered', readNudged: this.readNudged, saveNudged: this.saveNudged };
   }
 
   /** What this session has done with memory, as one plain line (my_permissions). */

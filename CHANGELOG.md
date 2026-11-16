@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.6.0
+
+- **The habits come first.** The instructions open with the three memory habits (search before
+  a task, save what lasts as it comes up, update a fact that changed), then the summary of what is
+  known, then the rules an agent must never miss (secrets, unverified senders, connecting). Hosts
+  that keep only the start of a server's instructions keep these. The summary is at most 10 lines
+  and 1,100 characters.
+- **The core memory tools stay loaded.** `search_memories` and `add_memory` carry
+  `_meta["anthropic/alwaysLoad"]`, so Claude Code shows them from the first turn instead of only
+  after a tool search.
+- **Hooks: `decoy-mcp-server hook <event> --host <host>`.** For coding hosts that run hooks
+  (Claude Code, Codex, Gemini CLI, Antigravity, Cursor): the brief at session start, the memories
+  that bear on each prompt (searched on this computer), a check when the agent stops that has it
+  save what the person said that lasts, and Decoy's memory reads and saves without a permission
+  prompt. See "Read and save on every task: hooks" in the README.
+- **Faster search in a new process.** Each memory's search vector is kept between runs in one file
+  encrypted with a key derived from the connection's private key, so a new session, a hook or a
+  call embeds only what is new.
+- **Search answers long memories as excerpts.** A memory longer than 600 characters comes back
+  cut on a word with `truncated: true`; `get_memory` returns it whole.
+- **Word-matching search ranks by what a memory says, not by its length.** One-shot calls (and a
+  prompt hook before the search vectors are kept) compare words: a score is the share of the
+  query's own words a memory holds, each once, with common words left out and long texts lowered,
+  so a long page does not outrank the short fact that answers the question.
+- **A counts-only record of memory use.** When a session ends, the bridge sends Decoy how it used
+  memory, as numbers and fixed words only; hooks send counts of what they did. `DECOY_USAGE_REPORT`
+  set to `off`, `false`, `0` or `no` turns it off. See "What the bridge reports" in the README.
+- **`DECOY_LISTING=true`.** The profile of a store-listed hosted connector: each memory tool says
+  when it applies, with no summary of memories and no reminders after results.
+- **Memory categories `finance`, `goals` and `relationships`.** `finance` is the person's own
+  money (a work budget stays `professional_details`); a goal also carries its subject's category;
+  `relationships` is friends and other people close to them outside their family, and `family` is
+  relatives, a partner and pets. `add_memory`, `update_memory` and `request_access` take them, and
+  `my_permissions` and refusals name a grant or an ask on any of them.
+- **Taking a label off a memory another connection saved goes through.** The new key also goes to
+  the connection that saved the memory, which keeps what it saved while it holds Save memories,
+  so `update_memory` saves the change instead of asking to read the memory again and retry.
+- **The first save after pairing is the full picture.** In the session that paired, the agent
+  saves everything it knows about the person, each memory filed correctly: what they told it, what
+  it has seen them do, and its own read of them, marked as its own. It guesses nothing about health,
+  sex life, religion or politics they have not told it. Guesses stated as facts are not saved. The
+  answer an agent gets when a new pairing is approved says the same, and to tell the person only
+  "Connected to Decoy."; a Reconnect or a restart does not get it.
+- **A refusal an agent cannot ask past says who can change it.** When the server says an access
+  cannot be requested, the message says the owner can change this connection's access in the Decoy
+  app, and that pairing again makes a new connection and does not help.
+- **One kind of agent key, from every source.** The key in `~/.decoy/mcp-agent-key.json`, in
+  `DECOY_AGENT_KEY` or in a credentials file is an RSA key of 2048, 3072 or 4096 bits with
+  exponent 65537 (the bridge makes 2048-bit keys with exponent 65537). Any other key stops the
+  bridge with a message that says where it is; `--logout` revokes the connection of any such key.
+
 ## 1.5.1
 
 - **Connecting asks for the reads the tools need.** Besides `account.create`, `memory.save` and
