@@ -42,13 +42,16 @@ import { z } from 'zod';
 import { applyAccountEdit, recordHoldsPassword, recordLogin, RecordEditError, type AccountEdit } from './account-edit.js';
 import { isDeepStrictEqual } from 'node:util';
 import { currentTotp, findTotpSeed, hasOtpAuthUri, isSeedShaped, isTotpKey, type TotpSeed } from './totp.js';
-import { isLocalRequestAllowed, resolveBindHost, browserCommand } from './local-guard.js';
+import { isLocalRequestAllowed, browserCommand, listenOnLoopback } from './local-guard.js';
+import { ownerOnly, canCheckConnectionAccount, refusalLog } from './peer-account.js';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { cliAnswer } from './cli-flags.js';
 import { readSecretFile, removeLeftoverTemps, LOCK_WAIT_MS } from './secret-file.js';
 import { readAnyCredentials, revokeRequests, onUnauthorized, type AgentKeyPair, type SavedCredentials } from './credentials.js';
 import { parseCreateResponse, pollForPairing } from './pairing-poll.js';
-import { agentIdentity, identityWarnings, pairingBase } from './agent-identity.js';
-import { syncIdentity, identityStateFile, forgetIdentity, IDENTITY_APPLIED_FILE, type IdentityStateFile } from './identity-sync.js';
+import { agentIdentity, identityWarnings, pairingBase, pairingIdentity, detectedAgent, detectedIdentity, identityConfigured, KNOWN_AGENTS, type ClientInfoLike } from './agent-identity.js';
+import { syncIdentity, syncDetectedIdentity, syncNamedIdentity, identityStateFile, forgetIdentity, IDENTITY_APPLIED_FILE, type IdentityStateFile, type DetectedSyncOutcome } from './identity-sync.js';
 import { jsonBody, jsonErrors, asyncRoute } from './http-body.js';
 import { checkClientData } from './passkey-check.js';
 import { hostMatches, hostOf, urlHostMatches, looksLikeHost, siteHost } from './host-match.js';
@@ -184,9 +187,9 @@ const subcommandArgs = (): string[] => { const all = process.argv.slice(2); cons
 /** The settings read from the environment. One the bridge refuses stops it with an error; in a
  *  `--context` run it is one line on standard output that names the variable (never its value)
  *  and exit 0, because a session-start hook must never fail a session. */
-function readConfig(): { api: ApiConfig; port: number; bindHost: string } {
+function readConfig(): { api: ApiConfig; port: number } {
   try {
-    return { api: resolveApiConfig(process.env), port: parsePort(process.env), bindHost: resolveBindHost(process.env.MCP_BIND_HOST) };
+    return { api: resolveApiConfig(process.env), port: parsePort(process.env) };
   } catch (e) {
     // A one-shot command says it in one line and ends with 1: it could not run.
     if ((CALL_RUN || TOOLS_RUN) && e instanceof ConfigError) { try { fs.writeSync(2, `❌  ${e.message}\n`); } catch { /* nobody is reading */ } process.exit(1); }
@@ -213,8 +216,7 @@ const OAUTH_BASE_URL = AGENT_API_URL.replace(/\/agent$/, '/oauth');
 const CONNECT_FRONTEND_URL = API.connectFrontendUrl;
 const AGENT_FOR = process.env.DECOY_AGENT_FOR ?? 'mcp';
 const PORT = CONFIG.port;
-// H7: loopback only, so nothing off this machine can reach the bridge.
-const BIND_HOST = CONFIG.bindHost;
+// H7: extra Host / Origin values the local guard accepts (comma-separated).
 const MCP_ALLOWED_HOSTS = (process.env.MCP_ALLOWED_HOSTS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 const MCP_ALLOWED_ORIGINS = (process.env.MCP_ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 const TOKEN_FILE = path.join(os.homedir(), '.decoy', 'mcp-token');
@@ -614,10 +616,13 @@ async function runBrowserPairing(keyPair: AgentKeyPair): Promise<string> {
   // is offered to the owner as "Reconnect": only their approval continues the earlier
   // connection, and nothing is revoked unless they choose it.
   const clientId = connection().clientId();
-  // The agent's site and icon (src/agent-identity.ts) go with every pairing ask.
-  const identity = agentIdentity(process.env);
+  const newClientId = connection().clientIdIsNew();
+  // The agent's site and icon (src/agent-identity.ts) go with every pairing ask: the configured
+  // ones, and on a first pairing with no site configured, the site the bridge worked out (the MCP
+  // host's, under --stdio, else the name this connection asks to be approved under).
+  const identity = pairingIdentity(process.env, detectedAgent({ client: hostClientInfo(), name: process.env.DECOY_AGENT_NAME }), !clientId || newClientId);
   for (const note of identity.notes) console.error(note);
-  const base = pairingBase({ name: process.env.DECOY_AGENT_NAME || 'MCP Server', publicKeySpki: keyPair.publicKeySpki, clientId, newClientId: connection().clientIdIsNew(), identity });
+  const base = pairingBase({ name: process.env.DECOY_AGENT_NAME || 'MCP Server', publicKeySpki: keyPair.publicKeySpki, clientId, newClientId, identity });
   const start = (older: boolean) => decoyFetch(`${CONNECT_API_URL}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -5654,7 +5659,8 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
 const app = express();
 // H7: the MCP SDK has no built-in DNS-rebinding/Origin protection, so gate every
 // request to local MCP clients only (loopback Host, no foreign Origin). Blocks
-// cross-site browser fetches and DNS-rebinding pages. Runs before the body is parsed.
+// cross-site browser fetches and DNS-rebinding pages. Runs first: it reads headers only, so a
+// web page never starts an account lookup.
 app.use((req, res, next) => {
   if (!isLocalRequestAllowed(req.headers, { port: PORT, allowedHosts: MCP_ALLOWED_HOSTS, allowedOrigins: MCP_ALLOWED_ORIGINS })) {
     res.status(403).json({ error: 'forbidden', message: 'The Decoy MCP bridge accepts local connections only.' });
@@ -5662,6 +5668,10 @@ app.use((req, res, next) => {
   }
   next();
 });
+// Then: only programs of the account that started the bridge (src/peer-account.ts). Loopback is
+// shared by every account on the computer (a CI runner's user, another person signed in).
+// Both run before the body is parsed.
+app.use(ownerOnly({ onRefused: refusalLog((line) => console.error(line)) }));
 app.use(jsonBody());
 
 const sessions = new SessionRegistry<StreamableHTTPServerTransport>();
@@ -5671,6 +5681,8 @@ const SESSION_IDLE_MS = 60 * 60_000;
 // Resolved at startup — set before MCP routes become active
 let globalToken = '';
 let globalKeyPair: AgentKeyPair | null = null;
+/** The connection the HTTP server runs on (main): its MCP clients' sites are sent for it. */
+let globalConnection: Connection | null = null;
 // Branded pairing URL for the in-flight session, surfaced in the 503 body so a
 // connecting agent can show the human where to scan (set by runBrowserPairing).
 let globalPairingUrl = '';
@@ -5704,6 +5716,12 @@ app.post('/mcp', asyncRoute(async (req, res) => {
       onsessioninitialized: (id) => { sessions.register(id, created); },
     });
     sessions.attach(created, () => mcp.close()); // before connect, so the SDK chains its cleanup
+    // The client's site, once it said who it is: only for the bridge's own connection, never for a
+    // token a request brought.
+    if (agentToken === globalToken && globalConnection) {
+      const on = globalConnection;
+      mcp.server.oninitialized = () => { void syncDetected({ token: agentToken, c: on, keyPair: globalKeyPair, client: mcp.server.getClientVersion() }); };
+    }
     transport = created;
     await prepareMemoryInstructions(mcp);
     await mcp.connect(transport);
@@ -5768,6 +5786,38 @@ function removeBeside(file: string): void {
 function identityRecordFor(c: Connection): IdentityStateFile | null {
   return identityStateFile({ source: c.source, decoyDir: path.dirname(TOKEN_FILE), credentialsFile: c.paths.credentialsFile ?? null,
     stateDir: process.env.DECOY_STATE_DIR?.trim() || null });
+}
+
+/** What the MCP host said about itself at initialize, under --stdio (runStdio sets it). */
+let hostClientInfo: () => ClientInfoLike | undefined = () => undefined;
+/** Sites already sent by this process, per connection: each is sent at most once a process. */
+const detectedSent = new Set<string>();
+
+/**
+ * The site this bridge worked out for its agent (agent-identity.ts detectedAgent: the MCP client's,
+ * else DECOY_AGENT_NAME's), sent once for a connection that has none (identity-sync.ts
+ * syncDetectedIdentity). With neither, the name Decoy holds for the connection says it
+ * (syncNamedIdentity). Nothing when a site or an icon is configured. Never throws.
+ */
+function syncDetected(o: { token: string; c: Connection; keyPair: AgentKeyPair | null | undefined; client?: ClientInfoLike | null }): Promise<DetectedSyncOutcome> {
+  try {
+    if (!o.token || identityConfigured(process.env)) return Promise.resolve('nothing');
+    const detected = detectedIdentity(process.env, detectedAgent({ client: o.client, name: process.env.DECOY_AGENT_NAME }));
+    const who = o.keyPair ? keyFingerprint(o.keyPair) : undefined;
+    const once = JSON.stringify([who ?? '', detected?.client_uri ?? 'by-name']);
+    if (detectedSent.has(once)) return Promise.resolve('unchanged');
+    detectedSent.add(once);
+    // One that did not reach a final answer (a limit, an error, no network) is tried again by the
+    // next session of this process.
+    const common = { token: o.token, agentApiUrl: AGENT_API_URL, fetchImpl: decoyFetch, stateFile: identityRecordFor(o.c), connection: who };
+    const sent = detected
+      ? syncDetectedIdentity({ detected, ...common })
+      : syncNamedIdentity({ ...common, table: JSON.stringify(KNOWN_AGENTS),
+          known: (name) => detectedIdentity(process.env, detectedAgent({ name })) });
+    return sent.then((out) => { if (out === 'skipped') detectedSent.delete(once); return out; });
+  } catch {
+    return Promise.resolve('skipped');
+  }
 }
 
 /** Remove this connection's session records where the one-shot commands keep them for it
@@ -6320,6 +6370,34 @@ async function runTools(argv: string[]): Promise<void> {
   finish(0, asked.json ? `${JSON.stringify(one)}\n` : renderTool(one));
 }
 
+/** How long a `call` waits, after its tool answered, for its connection's site to be sent: only the
+ *  first call of a connection sends it, and one cut short is sent again by the next call. */
+const CALL_IDENTITY_WAIT_MS = 5_000;
+
+/** Send the connection's site and icon from a `call`, in the background. The function it returns
+ *  waits for that, at most CALL_IDENTITY_WAIT_MS, and never throws. A connection with nowhere to
+ *  keep what was sent (identityStateFile: an environment connection with no DECOY_STATE_DIR) sends
+ *  nothing: every call would send it again. */
+function syncIdentityForCall(token: string): () => Promise<void> {
+  let running: Promise<unknown> = Promise.resolve();
+  try {
+    const c = connection();
+    const stateFile = identityRecordFor(c);
+    const who = c.keyPair ? keyFingerprint(c.keyPair) : undefined;
+    if (stateFile) {
+      running = Promise.allSettled([
+        syncIdentity({ identity: agentIdentity(process.env), token, agentApiUrl: AGENT_API_URL, fetchImpl: decoyFetch, stateFile, connection: who }),
+        syncDetected({ token, c, keyPair: c.keyPair, client: null }),
+      ]);
+    }
+  } catch { running = Promise.resolve(); }
+  return async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([running, new Promise<void>((r) => { timer = setTimeout(r, CALL_IDENTITY_WAIT_MS); })]);
+    clearTimeout(timer);
+  };
+}
+
 async function runCall(argv: string[]): Promise<void> {
   let asked: ReturnType<typeof parseCallArgs>;
   try { asked = parseCallArgs(argv); } catch (e) { if (!(e instanceof UsageError)) throw e; finish(2, '', e.message); return; }
@@ -6340,6 +6418,10 @@ async function runCall(argv: string[]): Promise<void> {
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     process.once(sig, () => { const end = (): void => { process.exit(1); }; if (refreshInFlight) void refreshInFlight.then(end, end); else end(); });
   }
+  // The connection's site and icon, beside the call: the configured ones (as at a server's start),
+  // and the site the bridge works out from the connection's name. Each is sent once per connection
+  // (identity-sync.ts keeps what was sent), so later calls send nothing.
+  const identityDone = syncIdentityForCall(token);
   const held = store?.load() ?? null;
   const before = held ? countsOf(held) : undefined;
   let accessSeen: string | null = null;
@@ -6359,9 +6441,11 @@ async function runCall(argv: string[]): Promise<void> {
       firstStepRecorded: () => firstStepOnRecord || (held?.context_at ?? null) !== null,
     } });
   } catch (e) {
+    await identityDone();
     finish(1, '', `❌  The tool call did not finish: ${scrubTokens(String((e as Error).message))}`);
     return;
   }
+  await identityDone();
   if (out.kind === 'unknown_tool') { finish(2, '', UNKNOWN_TOOL(asked.tool)); return; }
   // The session's counts, for the next call. A record that cannot be written never fails the call.
   let notes = '';
@@ -6390,8 +6474,15 @@ const firstSaveDue = (): boolean => pairingIsNew && !listingOn();
 const approvedAnswer = (): string => `${SETUP_DONE} ${firstSaveDue() ? AFTER_NEW_PAIRING : 'Retry this request.'}`;
 
 async function main() {
-  // Start the HTTP server (serves /mcp + /health; pairing UI lives on decoys.me)
-  await new Promise<void>(resolve => app.listen(PORT, BIND_HOST, resolve));
+  // Start the HTTP server (serves /mcp + /health; pairing UI lives on decoys.me) on both loopback
+  // addresses, or not at all (local-guard.ts listenOnLoopback).
+  let listening: Server[];
+  try {
+    listening = await listenOnLoopback(app, PORT);
+  } catch (e) {
+    console.error(`❌  ${(e as Error).message}`);
+    process.exit(1);
+  }
   setInterval(() => { void sessions.reapIdle(SESSION_IDLE_MS); }, 5 * 60_000).unref();
   // Close every session (and its memory engine) before exiting on Ctrl-C or a stop signal.
   // SIGHUP too: a closed terminal or a dropped SSH session is a stop like Ctrl-C.
@@ -6402,7 +6493,11 @@ async function main() {
       void sessions.reapIdle(-1).finally(() => process.exit(0));
     });
   }
-  console.error(`Decoy MCP Server v${PACKAGE_VERSION} on ${BIND_HOST}:${PORT} (${API.isProduction ? 'prod' : API.apiHost})`);
+  const on = listening.map((s) => { const a = s.address() as AddressInfo; return a.family === 'IPv6' ? `[${a.address}]:${a.port}` : `${a.address}:${a.port}`; }).join(' and ');
+  console.error(`Decoy MCP Server v${PACKAGE_VERSION} on ${on} (${API.isProduction ? 'prod' : API.apiHost})`);
+  if (!canCheckConnectionAccount(process.platform)) {
+    console.error(`[Decoy] On this system the bridge cannot tell which account a connection comes from: any program on this computer that reaches port ${PORT} can use it.`);
+  }
 
   try {
     const c = connection({ reconnect: process.argv.includes('--reconnect') });
@@ -6416,6 +6511,9 @@ async function main() {
     // new pairing (identity-sync.ts). In the background: start-up never waits for it.
     void syncIdentity({ identity: agentIdentity(process.env), token: globalToken, agentApiUrl: AGENT_API_URL, fetchImpl: decoyFetch,
       stateFile: identityRecordFor(c), connection: globalKeyPair ? keyFingerprint(globalKeyPair) : undefined });
+    // A site the bridge works out itself waits for the first MCP client: what it says about itself
+    // comes before the connection's name (app.post('/mcp')).
+    globalConnection = c;
   } catch (err) {
     // Denied, expired or failed BEFORE approval: nothing was written anywhere, and it says so.
     // After approval the error itself says what is true (the commit's own message).
@@ -6425,7 +6523,7 @@ async function main() {
   }
 
   console.error(`Agent API: ${AGENT_API_URL}`);
-  console.error('Ready — connect Claude Desktop to http://localhost:' + PORT + '/mcp');
+  console.error(`Ready — connect your MCP client to http://127.0.0.1:${PORT}/mcp`);
 }
 
 // ── Standard input and output (--stdio) ───────────────────────────────────────
@@ -6474,11 +6572,17 @@ async function runStdio(): Promise<void> {
     canSample: () => hostSamples(), instructionsNote: STDIO_INSTRUCTIONS_NOTE,
     ...(DESKTOP_EXTENSION ? { firstStepRecorded: () => true, bridgeUpdates: false } : {}),
   };
+  // The host's site goes once the host said who it is (initialize) and there is a connection.
+  let hostSaid = false;
+  let inUse: { token: string; keyPair: AgentKeyPair; c: Connection } | null = null;
+  const sendHostSite = () => { if (hostSaid && inUse) void syncDetected({ ...inUse, client: hostClientInfo() }); };
   const serverOn = (token: string, keyPair: AgentKeyPair, c: Connection): Promise<Client> => {
     globalToken = token;
     globalKeyPair = keyPair;
     void syncIdentity({ identity: agentIdentity(process.env), token, agentApiUrl: AGENT_API_URL, fetchImpl: decoyFetch,
       stateFile: identityRecordFor(c), connection: keyFingerprint(keyPair) });
+    inUse = { token, keyPair, c };
+    sendHostSite();
     return inProcessClient(buildMcpServer(token, keyPair.privateKeyPem, deps));
   };
 
@@ -6565,6 +6669,8 @@ async function runStdio(): Promise<void> {
   const answer = (text: string) => ({ isError: true, content: [{ type: 'text' as const, text }] });
   const proxy = createStdioProxy({
     name: 'decoy', version: PACKAGE_VERSION, listing, connected: connectedClient, findSaved,
+    // A host that lists or calls tools has initialized even if it never said so: its site goes then.
+    onRequest: () => { if (!hostSaid && proxy.server.getClientVersion()) { hostSaid = true; sendHostSite(); } },
     stale: () => lostToken !== null,
     firstNote: `How to talk to the person about Decoy: ${PLAIN_WORDS} This holds for everyone, people who build Decoy too. When you need access, send the request; never ask whether to.`,
     notPaired: async () => {
@@ -6591,6 +6697,8 @@ async function runStdio(): Promise<void> {
     },
   });
   hostSamples = () => !!proxy.server.getClientCapabilities()?.sampling;
+  hostClientInfo = () => proxy.server.getClientVersion();
+  proxy.server.oninitialized = () => { hostSaid = true; sendHostSite(); };
 
   // The host closing the pipe (or stopping the process) ends the bridge, after its servers close.
   let ending = false;

@@ -14,17 +14,25 @@
  * the values themselves is recorded too, so it is not resent every start; a missing route, a
  * limit, a server error or no network records nothing and the next start tries again. It never
  * throws and never logs the token or the file.
+ *
+ * The site the bridge worked out itself (agent-identity.ts detectedAgent, for a connection with no
+ * site configured) goes through syncDetectedIdentity: once per connection, with its own fingerprint
+ * in the same record, and only to a connection that shows the robot (no favicon, no picked icon but
+ * the robot). Decoy takes a site only from a connection that has none yet, or one on the same domain
+ * as its own (lib/agent-icon-update.ts, ruling 2026-10-27 B); any other connection answers 409 and
+ * keeps its site, and nothing more is sent or said. The detected icon is sent only when the
+ * connection still shows the robot after that (no favicon could be fetched).
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AgentIdentity } from './agent-identity.js';
+import { DEFAULT_AGENT_ICON, type AgentIdentity, type DetectedAgent } from './agent-identity.js';
 import { writeSecretFile, writeSecretFileIn, readSecretFileIn } from './secret-file.js';
 
 /** A fingerprint of what the server last answered for, per connection. */
 export const IDENTITY_APPLIED_FILE = 'identity-applied.json';
-/** Connections one record holds at most (the oldest go first). */
-const MAX_CONNECTIONS = 20;
+/** Entries one record holds at most, three per connection (the oldest go first). */
+const MAX_ENTRIES = 60;
 
 /** The record's file. `own`: in ~/.decoy, the bridge's own directory. Otherwise a folder the user
  *  chose: its permissions are never changed, and it is used only if it is safe to write secrets in
@@ -45,17 +53,32 @@ export function identityStateFile(o: { source: string; decoyDir: string; credent
 
 /** A connection's key in the record: a hash, never the value it was made from. */
 const keyOf = (connection: string) => crypto.createHash('sha256').update(`decoy-identity-connection:${connection}`).digest('hex').slice(0, 32);
+/** The key of the site the bridge worked out for that connection (syncDetectedIdentity). */
+const detectedKeyOf = (connection: string) => crypto.createHash('sha256').update(`decoy-identity-detected:${connection}`).digest('hex').slice(0, 32);
+/** The key of the look at that connection's name (syncNamedIdentity). */
+const namedKeyOf = (connection: string) => crypto.createHash('sha256').update(`decoy-identity-named:${connection}`).digest('hex').slice(0, 32);
 
 /** Forget one connection's record (a logout of that connection). */
 export function forgetIdentity(file: IdentityStateFile | null, connection: string): void {
   if (!file) return;
   const all = readAll(file);
-  if (!(keyOf(connection) in all)) return;
-  delete all[keyOf(connection)];
+  const keys = [keyOf(connection), detectedKeyOf(connection), namedKeyOf(connection)].filter((k) => k in all);
+  if (!keys.length) return;
+  for (const k of keys) delete all[k];
   write(file, all);
 }
 
+/** A record kept for one key: whether it already holds this fingerprint (or one of `also`), and how to keep it. */
+function recordFor(stateFile: IdentityStateFile | null, key: string, fingerprint: string, also: string[] = []) {
+  return {
+    seen: () => { if (!stateFile) return false; const held = readAll(stateFile)[key]; return held === fingerprint || also.includes(held); },
+    keep: (as: string = fingerprint) => { if (stateFile) { const all = readAll(stateFile); delete all[key]; all[key] = as; write(stateFile, all); } },
+  };
+}
+
 export type SyncOutcome = 'nothing' | 'unchanged' | 'applied' | 'icon_only' | 'refused' | 'skipped';
+/** `kept`: the connection has a site on another domain and keeps it. */
+export type DetectedSyncOutcome = 'nothing' | 'unchanged' | 'applied' | 'kept' | 'refused' | 'skipped';
 
 export async function syncIdentity(o: {
   identity: AgentIdentity;
@@ -76,9 +99,9 @@ export async function syncIdentity(o: {
     if (!want.client_uri && !want.icon) return 'nothing';
     const host = new URL(o.agentApiUrl).host;
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ v: 1, host, ...want })).digest('hex');
-    const who = keyOf(o.connection ?? '');
-    const recordIt = () => { if (o.stateFile) { const all = readAll(o.stateFile); delete all[who]; all[who] = fingerprint; write(o.stateFile, all); } };
-    if (o.stateFile && readAll(o.stateFile)[who] === fingerprint) return 'unchanged';
+    const record = recordFor(o.stateFile, keyOf(o.connection ?? ''), fingerprint);
+    const recordIt = record.keep;
+    if (record.seen()) return 'unchanged';
 
     const send = async (body: typeof want) => (o.fetchImpl ?? fetch)(`${o.agentApiUrl}/identity`, {
       method: 'PATCH',
@@ -104,6 +127,130 @@ export async function syncIdentity(o: {
   }
 }
 
+/** What GET /api/agent/identity says the connection shows. */
+export interface ConnectionShows { name?: unknown; icon?: unknown; has_favicon?: unknown; has_site?: unknown }
+
+/** It shows the robot: no favicon, and no picked icon but the robot. Only such a connection is changed. */
+const showsRobot = (s: ConnectionShows): boolean => s.has_favicon !== true && (s.icon === null || s.icon === undefined || s.icon === DEFAULT_AGENT_ICON);
+
+const today = (now?: () => Date): string => (now ?? (() => new Date()))().toISOString().slice(0, 10);
+
+/** GET /api/agent/identity: what the connection shows, `absent` for a server without the read, or `skip`. */
+async function readShows(o: { token: string; agentApiUrl: string; fetchImpl?: typeof fetch }): Promise<ConnectionShows | 'absent' | 'refused' | 'skip'> {
+  const res = await (o.fetchImpl ?? fetch)(`${o.agentApiUrl}/identity`, { method: 'GET', headers: { authorization: `Bearer ${o.token}` } });
+  if (res.status === 404 || res.status === 405) return 'absent';
+  if (res.status === 403) return 'refused';
+  if (!res.ok) return 'skip';
+  const shows = (await res.json().catch(() => null)) as ConnectionShows | null;
+  return shows && typeof shows === 'object' && typeof shows.name === 'string' ? shows : 'skip';
+}
+
+/**
+ * Send the site the bridge worked out (agent-identity.ts detectedIdentity: already without what is
+ * configured) to a connection that shows the robot, once. What the connection shows is read first
+ * (GET /api/agent/identity, or `shows` when the caller read it): one with a favicon, or a picked
+ * icon other than the robot, is left as it is. Then PATCH { client_uri } alone, and { icon } only
+ * when the answer says it still shows the robot. A 409 (a site on another domain) leaves it as it
+ * is, says nothing, and is recorded; a refusal (400, 403) is recorded. A server without the read
+ * (404, 405) or without the site rule yet (503) is asked again the next day (UTC); a limit, an
+ * error, an expired token or no network records nothing. Never throws, never logs.
+ */
+export async function syncDetectedIdentity(o: {
+  detected: DetectedAgent | null;
+  token: string;
+  agentApiUrl: string;
+  stateFile: IdentityStateFile | null;
+  connection?: string;
+  fetchImpl?: typeof fetch;
+  /** What the connection shows, when the caller already read it. */
+  shows?: ConnectionShows;
+  /** Test seam: the clock for the day a server that cannot take a site is asked again. */
+  now?: () => Date;
+}): Promise<DetectedSyncOutcome> {
+  try {
+    const d = o.detected;
+    if (!d?.client_uri) return 'nothing';
+    const host = new URL(o.agentApiUrl).host;
+    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 1, detected: true, host, client_uri: d.client_uri, icon: d.icon ?? null, ...extra })).digest('hex');
+    const notYetToday = fp({ absent: today(o.now) });
+    const record = recordFor(o.stateFile, detectedKeyOf(o.connection ?? ''), fp({}), [notYetToday]);
+    if (record.seen()) return 'unchanged';
+
+    const shows = o.shows ?? await readShows(o);
+    if (shows === 'absent') { record.keep(notYetToday); return 'nothing'; }
+    if (shows === 'refused') { record.keep(); return 'refused'; }
+    if (shows === 'skip') return 'skipped';
+    if (!showsRobot(shows)) { record.keep(); return 'kept'; }
+
+    const send = async (body: { client_uri?: string; icon?: string }) => (o.fetchImpl ?? fetch)(`${o.agentApiUrl}/identity`, {
+      method: 'PATCH',
+      headers: { authorization: `Bearer ${o.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const res = await send({ client_uri: d.client_uri });
+    if (res.status === 409 || res.status === 503) {
+      const code = ((await res.json().catch(() => ({}))) as { code?: string }).code;
+      if (code === 'CLIENT_URI_DOMAIN_CHANGE_NEEDS_RECONNECT') { record.keep(); return 'kept'; }
+      if (code === 'IDENTITY_SITE_UNAVAILABLE') { record.keep(notYetToday); return 'nothing'; }
+      return 'skipped';
+    }
+    if (res.status === 400 || res.status === 403) { record.keep(); return 'refused'; }
+    if (!res.ok) return 'skipped';
+    const after = (await res.json().catch(() => ({}))) as ConnectionShows;
+    if (d.icon && after.has_favicon === false && showsRobot(after) && d.icon !== after.icon) {
+      const r = await send({ icon: d.icon });
+      if (!r.ok && r.status !== 400 && r.status !== 403) return 'skipped';
+    }
+    record.keep();
+    return 'applied';
+  } catch {
+    return 'skipped';
+  }
+}
+
+/**
+ * With nothing else to go on, the site the connection's own name says: GET /api/agent/identity answers
+ * the name the owner approved (or renamed the connection to) and what it shows. A connection that
+ * shows the robot and whose name `known` maps to a site gets it through syncDetectedIdentity; any
+ * other is left as it is. Asked once per connection and `table` (the known agents: a bridge that
+ * knows more asks again). A server without the read yet (404, 405) is asked again the next day
+ * (UTC); a limit, an error, an expired token or no network records nothing, nor does a site that did
+ * not land. Never throws.
+ */
+export async function syncNamedIdentity(o: {
+  /** The site a connection name says (detectedIdentity of detectedAgent({ name })), or null. */
+  known: (name: string) => DetectedAgent | null;
+  /** What `known` knows, as a string: a change asks again. */
+  table: string;
+  token: string;
+  agentApiUrl: string;
+  stateFile: IdentityStateFile | null;
+  connection?: string;
+  fetchImpl?: typeof fetch;
+  /** Test seam: the clock for the day a missing route is asked again. */
+  now?: () => Date;
+}): Promise<DetectedSyncOutcome> {
+  try {
+    const host = new URL(o.agentApiUrl).host;
+    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 1, named: true, host, table: o.table, ...extra })).digest('hex');
+    const absentToday = fp({ absent: today(o.now) });
+    const record = recordFor(o.stateFile, namedKeyOf(o.connection ?? ''), fp({}), [absentToday]);
+    if (record.seen()) return 'unchanged';
+    const shows = await readShows(o);
+    if (shows === 'absent') { record.keep(absentToday); return 'nothing'; }
+    if (shows === 'refused') { record.keep(); return 'refused'; }
+    if (shows === 'skip') return 'skipped';
+    if (!showsRobot(shows)) { record.keep(); return 'kept'; }
+    const detected = o.known(shows.name as string);
+    if (!detected) { record.keep(); return 'nothing'; }
+    const out = await syncDetectedIdentity({ detected, shows, token: o.token, agentApiUrl: o.agentApiUrl, stateFile: o.stateFile, connection: o.connection, fetchImpl: o.fetchImpl, now: o.now });
+    if (out !== 'skipped') record.keep();
+    return out;
+  } catch {
+    return 'skipped';
+  }
+}
+
 /** The record: connection key → fingerprint, both hex. Anything else in the file is not used. */
 function readAll(at: IdentityStateFile): Record<string, string> {
   try {
@@ -120,7 +267,7 @@ function readAll(at: IdentityStateFile): Record<string, string> {
 
 function write(at: IdentityStateFile, all: Record<string, string>): void {
   try {
-    const data = JSON.stringify({ v: 2, applied: Object.fromEntries(Object.entries(all).slice(-MAX_CONNECTIONS)) });
+    const data = JSON.stringify({ v: 2, applied: Object.fromEntries(Object.entries(all).slice(-MAX_ENTRIES)) });
     // ~/.decoy is the bridge's own and kept owner-only; a folder the user chose is written into
     // only when it is safe for secrets, and never changed.
     if (at.own) writeSecretFile(at.file, data); else writeSecretFileIn(at.file, data);

@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.7.0
+
+- **The Decoy app shows the agent's icon with no setting.** When no site and no icon are
+  configured, the bridge works out the agent's site: the site the MCP client gives about itself
+  (`websiteUrl`), else the agent its client name says, else the agent `DECOY_AGENT_NAME` says, else
+  the agent the connection's name in the Decoy app says (read once with `GET /api/agent/identity`).
+  A first pairing sends that site and its icon instead of `robot`. A connection that shows the
+  `robot` gets the site once, when the host or the first MCP client connects, or with the next
+  `call`, so an existing connection shows its agent's favicon with nothing to do. A connection that
+  shows a favicon or another picked icon keeps it. See [The agent's icon](README.md#the-agents-icon).
+- **`DECOY_AGENT_FOR` knows more agents:** `claude-desktop`, `claude-ai`, `chatgpt`, `gemini-cli`,
+  `antigravity`, `vscode`, `grok`, `muse` and `instinct`, the words the usage counts use.
+- **`call` sends the configured site and icon too,** once per connection, as a server does when it
+  starts, for a connection with a place for its record: the saved connection, a credentials file,
+  or `DECOY_STATE_DIR`.
+- **Only programs of the account that started the bridge can use it over HTTP.** On macOS and
+  Linux the bridge checks which account's program holds the other end of each connection, and
+  answers `403` to a program of another account on the same computer, such as a CI runner's user.
+  MCP clients need no new setting. On Windows and in WSL the bridge says when it starts that it
+  cannot tell which account a connection comes from.
+- **The bridge listens on both `127.0.0.1` and `::1`.** `localhost` resolves to `::1` first on
+  many systems, so the bridge holds that address too, and does not start when another program
+  already listens on `127.0.0.1` or `::1` at its port. The README and the start-up line give
+  `http://127.0.0.1:3001/mcp`. `MCP_BIND_HOST` is not read.
+- **While the bridge is not running, another program can take its port.** The README says so: an
+  MCP client reaches whatever program listens there, so on a computer shared with other accounts,
+  use `--stdio`, where the client starts the bridge and talks to it over a pipe.
+
 ## 1.6.0
 
 - **The habits come first.** The instructions open with the three memory habits (search before

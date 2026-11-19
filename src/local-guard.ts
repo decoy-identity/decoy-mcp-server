@@ -15,7 +15,7 @@
 //   - Any Origin present must be loopback (or explicitly allow-listed) → a real
 //     web page's Origin is rejected.
 
-import { ConfigError } from './api-config.js';
+import { createServer, type RequestListener, type Server } from 'node:http';
 
 export interface GuardOptions {
   port: number;
@@ -25,15 +25,46 @@ export interface GuardOptions {
   allowedOrigins?: string[];
 }
 
-/** The interface the bridge listens on: loopback only. There is no off-machine mode — the
- *  bridge holds the owner's token and decrypts locally, so anything that reaches the port acts
- *  as the owner. */
-export function resolveBindHost(requested: string | undefined): string {
-  const host = (requested ?? '127.0.0.1').trim();
-  if (!isLoopbackHostname(host)) {
-    throw new ConfigError('MCP_BIND_HOST', `MCP_BIND_HOST=${host} is not a loopback address. The Decoy bridge only listens on 127.0.0.1, ::1 or localhost.`);
+/** The addresses the bridge listens on: both loopback addresses, on the same port, and nothing
+ *  else. There is no off-machine mode — the bridge holds the owner's token and decrypts locally, so
+ *  anything that reaches the port acts as the owner. `localhost` resolves to ::1 first on many
+ *  systems, and a client set up with http://localhost:PORT tries it first, so a free [::1]:PORT
+ *  would let any program of any account receive the owner's MCP traffic. The bridge holds both, and
+ *  does not start when another program already listens on 127.0.0.1 or ::1 at the port. */
+export const LOOPBACK_ADDRESSES = ['127.0.0.1', '::1'] as const;
+
+/** Errors that mean this system has no such address (no IPv6 loopback): nothing can listen there. */
+const NO_SUCH_ADDRESS = new Set(['EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL']);
+
+export class PortTakenError extends Error {
+  constructor(readonly port: number, readonly address: string) {
+    super(`Port ${port} on ${address} is taken by another program, so the Decoy bridge did not start: an MCP client could reach that program instead. ` +
+      'Stop that program, or start the bridge on another port with DECOY_MCP_PORT and point your MCP client at it.');
+    this.name = 'PortTakenError';
   }
-  return host;
+}
+
+/** Listen on every loopback address this system has, or on none. */
+export async function listenOnLoopback(handler: RequestListener, port: number): Promise<Server[]> {
+  const servers: Server[] = [];
+  const closeAll = () => { for (const s of servers) s.close(); };
+  for (const address of LOOPBACK_ADDRESSES) {
+    const server = createServer(handler);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen({ port, host: address, ipv6Only: address === '::1' }, () => { server.off('error', reject); resolve(); });
+      });
+      servers.push(server);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? '';
+      if (address === '::1' && NO_SUCH_ADDRESS.has(code)) continue;
+      closeAll();
+      if (code === 'EADDRINUSE') throw new PortTakenError(port, address);
+      throw e;
+    }
+  }
+  return servers;
 }
 
 /** How to open a URL in the user's browser without a shell: the URL is one argument. */

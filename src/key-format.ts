@@ -1,9 +1,18 @@
 // key-format: key-id
 // key-format: pairing-qr
+// key-format: seal
+// key-format: wrap
 //
-// Key ids and the pairing QR, the same formats byte for byte as the Decoy API writes them, checked
-// against the same sha-pinned vectors (key-id.vectors.json and pairing-qr.vectors.json).
-//   key id     = base64url, no padding, of SHA-256 over the public key's canonical SubjectPublicKeyInfo DER
+// Key ids, the pairing QR, and the seal and wrap readers: the same formats byte for byte as the
+// Decoy API's, checked against the same sha-pinned vectors (key-id.vectors.json,
+// pairing-qr.vectors.json, seal.vectors.json and wrap.vectors.json). This module reads seals and
+// wraps; it writes neither.
+//   key id     = base64url, no padding, of SHA-256 over the public key's canonical SubjectPublicKeyInfo DER;
+//                for a 32-byte symmetric key, of HMAC-SHA256 of the key over decoy/key-id/symmetric
+//   seal       = 0xC5 ‖ 0x01 ‖ key_id (32) ‖ nonce (12) ‖ AES-256-GCM ciphertext ‖ tag (16), the header,
+//                kind, record id and field bound as associated data (openSeal)
+//   wrap       = 0xC6 ‖ 0x01 ‖ recipient_key_id (32) ‖ RSA-OAEP-SHA-256 of the same 34 bytes ‖
+//                wrapped_key_id (32) ‖ key (32) (openWrap)
 //   pairing QR = decoy://connect?code=CODE[&kid=KEY_ID][&keep=KEY_ID]&v=1 (decoy-dev:// for development),
 //                written from the requester's own keys; the hand-off link
 //                https://www.decoys.me/connect?code=CODE[&env=dev][&kid=…][&keep=…]&v=1 carries the same
@@ -36,7 +45,7 @@
 //      a modulus under 2048 bits; UNSUPPORTED_KEY for any size but 2048, 3072 or 4096 (an even
 //      modulus included: the size comes first); WEAK_KEY for an exponent other than 65537 (0
 //      included) or an even modulus, which nothing can wrap to.
-import { createHash, createPublicKey } from 'node:crypto';
+import { constants, createDecipheriv, createHash, createHmac, createPublicKey, privateDecrypt, type KeyObject } from 'node:crypto';
 
 // 32 bytes leave 2 unused bits in the 43rd base64url character, so only 16 characters can end a
 // canonical id. Another last character spells the same bytes differently and is refused.
@@ -232,6 +241,22 @@ export function spkiFromRsaPkcs1(rsaPublicKeyDer: Uint8Array): Buffer {
   return canonicalSpki(Buffer.concat([Buffer.from([0x30]), derLength(body.length), body]));
 }
 
+/** The label a symmetric key's id is the HMAC of (hkdf-labels: decoy/<format id>/<purpose>). */
+export const SYMMETRIC_KEY_ID_LABEL = 'decoy/key-id/symmetric';
+/** The only length of a symmetric key with an id: AES-256. */
+export const SYMMETRIC_KEY_BYTES = 32;
+
+/**
+ * The key id of a symmetric key: HMAC-SHA256 with the key itself as the HMAC key, over the ASCII
+ * label, base64url without padding. Only a key of exactly 32 bytes has one: HMAC pads a shorter key
+ * with zeros (so K and K followed by a zero byte would share an id) and hashes a key longer than 64
+ * bytes first, and neither can happen at exactly 32. Any other length is NOT_A_KEY.
+ */
+export function symmetricKeyId(key: Uint8Array): string {
+  if (!(key instanceof Uint8Array) || key.length !== SYMMETRIC_KEY_BYTES) throw notAKey('only a 32-byte symmetric key has an id');
+  return createHmac('sha256', key).update(SYMMETRIC_KEY_ID_LABEL, 'ascii').digest('base64url');
+}
+
 
 export type PairingQr = { code: string; env: 'dev' | null; kid: string | null; keep: string | null };
 export type PairingQrErrorCode =
@@ -423,4 +448,184 @@ export function checkPairing(
   const pinOf = (r: Outcome) => ('checked' in r ? r.checked : 'firstUse' in r ? r.firstUse : null);
   const checked = ('checked' in agent || 'checked' in keep) && !('firstUse' in agent) && !('firstUse' in keep);
   return { approve: true, checked, pin: { kid: pinOf(agent), keep: pinOf(keep) } };
+}
+
+export const SEAL_FORMAT_BYTE = 0xc5;
+export const SEAL_VERSION = 0x01;
+/** Format byte, version and key id: the header, and the start of the associated data. */
+export const SEAL_HEADER_BYTES = 34;
+export const SEAL_NONCE_BYTES = 12;
+export const SEAL_TAG_BYTES = 16;
+/** Everything but the ciphertext: an empty plaintext gives a seal of exactly this length. */
+export const SEAL_OVERHEAD_BYTES = 62;
+/** The longest plaintext a seal holds: 64 MiB. */
+export const SEAL_MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
+
+export type SealErrorCode = 'NOT_A_SEAL' | 'UNKNOWN_VERSION' | 'TOO_LARGE' | 'KEY_MISMATCH' | 'BAD_CONTEXT' | 'OPEN_FAILED';
+
+/** One fixed message per code, so a refusal carries nothing of the seal or its context. */
+export const SEAL_MESSAGES: Readonly<Record<SealErrorCode, string>> = Object.freeze({
+  NOT_A_SEAL: 'not a seal',
+  UNKNOWN_VERSION: 'a seal version this reader does not know',
+  TOO_LARGE: 'a seal longer than the largest one allowed',
+  KEY_MISMATCH: "the seal is not under the record's key, or that key is not held",
+  BAD_CONTEXT: 'a seal context out of form',
+  OPEN_FAILED: 'the seal does not open',
+});
+
+export class SealError extends Error {
+  constructor(readonly code: SealErrorCode, message: string) {
+    super(message);
+    this.name = 'SealError';
+  }
+}
+
+const sealError = (code: SealErrorCode) => new SealError(code, SEAL_MESSAGES[code]);
+
+/** Where a seal is stored: the record's kind, its id and the field, or '' for the whole record. */
+export type SealContext = { kind: string; recordId: string; field: string };
+
+/** 1-64 bytes of a-z 0-9 _, first a letter. */
+const SEAL_KIND_RE = /^[a-z][a-z0-9_]{0,63}$/;
+/** A UUID, lowercase and hyphenated: exactly 36 bytes. Any other spelling is refused, never lower-cased. */
+const SEAL_RECORD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Empty (the whole record), or 1-64 bytes of a-z 0-9 _ ., first a letter. */
+const SEAL_FIELD_RE = /^(?:[a-z][a-z0-9_.]{0,63})?$/;
+
+/**
+ * The associated data of a seal: its 34-byte header, then kind, record id and field, each after a
+ * one-byte length. A context out of form is BAD_CONTEXT, for a writer as for the reader.
+ */
+export function sealAssociatedData(header: Uint8Array, context: SealContext): Buffer {
+  if (header.length !== SEAL_HEADER_BYTES) throw sealError('NOT_A_SEAL');
+  const { kind, recordId, field } = context ?? ({} as SealContext);
+  if (typeof kind !== 'string' || typeof recordId !== 'string' || typeof field !== 'string') throw sealError('BAD_CONTEXT');
+  if (!SEAL_KIND_RE.test(kind) || !SEAL_RECORD_ID_RE.test(recordId) || !SEAL_FIELD_RE.test(field)) throw sealError('BAD_CONTEXT');
+  const part = (s: string) => Buffer.concat([Buffer.from([s.length]), Buffer.from(s, 'ascii')]);
+  return Buffer.concat([Buffer.from(header), part(kind), part(recordId), part(field)]);
+}
+
+/**
+ * Open a seal with the record's key: `expectedKeyId` is the symmetric key id of the key the record
+ * must be under, from the caller's own state, never from the seal or the row. The header must name
+ * that id and a held key must have it (a held key that isn't 32 bytes has no id, so it is never
+ * picked); the seal is checked against the context it is stored under. Returns the plaintext, or
+ * throws SealError with the code of the first check that fails. Every code but OPEN_FAILED comes
+ * before any tag check.
+ */
+export function openSeal(seal: Uint8Array, keys: readonly Uint8Array[], context: SealContext, expectedKeyId: string): Buffer {
+  if (!(seal instanceof Uint8Array)) throw sealError('NOT_A_SEAL');
+  const b = Buffer.from(seal.buffer, seal.byteOffset, seal.byteLength);
+  if (b.length < SEAL_OVERHEAD_BYTES || b[0] !== SEAL_FORMAT_BYTE) throw sealError('NOT_A_SEAL');
+  if (b[1] !== SEAL_VERSION) throw sealError('UNKNOWN_VERSION');
+  if (b.length - SEAL_OVERHEAD_BYTES > SEAL_MAX_PLAINTEXT_BYTES) throw sealError('TOO_LARGE');
+  const named = b.subarray(2, SEAL_HEADER_BYTES).toString('base64url');
+  if (named !== expectedKeyId) throw sealError('KEY_MISMATCH');
+  const key = keys.find((k) => k instanceof Uint8Array && k.length === SYMMETRIC_KEY_BYTES && symmetricKeyId(k) === named);
+  if (!key) throw sealError('KEY_MISMATCH');
+  const ad = sealAssociatedData(b.subarray(0, SEAL_HEADER_BYTES), context);
+  const nonce = b.subarray(SEAL_HEADER_BYTES, SEAL_HEADER_BYTES + SEAL_NONCE_BYTES);
+  const ciphertext = b.subarray(SEAL_HEADER_BYTES + SEAL_NONCE_BYTES, b.length - SEAL_TAG_BYTES);
+  const decipher = createDecipheriv('aes-256-gcm', key, nonce, { authTagLength: SEAL_TAG_BYTES });
+  decipher.setAAD(ad);
+  decipher.setAuthTag(b.subarray(b.length - SEAL_TAG_BYTES));
+  // decipher.update returns bytes before the tag is checked: they are kept here, wiped and never
+  // returned unless final() passes.
+  const plaintext = decipher.update(ciphertext);
+  try {
+    decipher.final();
+  } catch {
+    plaintext.fill(0);
+    throw sealError('OPEN_FAILED');
+  }
+  return plaintext;
+}
+
+export const WRAP_FORMAT_BYTE = 0xc6;
+export const WRAP_VERSION = 0x01;
+/** Format byte, version and recipient key id, outside and again at the start of the payload. */
+export const WRAP_HEADER_BYTES = 34;
+/** The OAEP plaintext: the header, the wrapped key's id and the 32-byte key. */
+export const WRAP_PAYLOAD_BYTES = 98;
+/** The only lengths a wrap has: the header and one RSA-2048, RSA-3072 or RSA-4096 block. */
+export const WRAP_BYTES: readonly number[] = [290, 418, 546];
+
+export type WrapErrorCode = 'NOT_A_WRAP' | 'UNKNOWN_VERSION' | 'NOT_FOR_ME' | 'OPEN_FAILED' | 'BAD_PAYLOAD' | 'KEY_MISMATCH' | 'NOT_COMMITTED';
+
+/** One fixed message per code, so a refusal carries nothing of the wrap (no oracle in the OAEP failures). */
+export const WRAP_MESSAGES: Readonly<Record<WrapErrorCode, string>> = Object.freeze({
+  NOT_A_WRAP: 'not a wrap',
+  UNKNOWN_VERSION: 'a wrap version this reader does not know',
+  NOT_FOR_ME: 'the wrap names a recipient key this reader does not hold',
+  OPEN_FAILED: 'the wrap does not open',
+  BAD_PAYLOAD: 'the wrap payload is not the one its header names',
+  KEY_MISMATCH: 'the wrapped key is not the key its id names',
+  NOT_COMMITTED: 'the wrapped key is not the key the signed object names',
+});
+
+export class WrapError extends Error {
+  constructor(readonly code: WrapErrorCode, message: string) {
+    super(message);
+    this.name = 'WrapError';
+  }
+}
+
+const wrapError = (code: WrapErrorCode) => new WrapError(code, WRAP_MESSAGES[code]);
+
+/** A held RSA private key's key id, or null when it is not an RSA private key with an id (key-id). */
+function heldRsaKeyId(key: KeyObject): string | null {
+  if (key?.type !== 'private' || key.asymmetricKeyType !== 'rsa') return null;
+  try {
+    return keyIdFromSpki(createPublicKey(key).export({ type: 'spki', format: 'der' }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open a wrap with the held RSA private key its recipient id names, and return the wrapped key and
+ * its id once that id is `committedKeyId`, the id a signed object the caller trusts names for this
+ * key (the wrap's own ids prove only that they match its key). Throws WrapError with the code of
+ * the first check that fails. NOT_A_WRAP, UNKNOWN_VERSION and NOT_FOR_ME come before anything is
+ * decrypted.
+ */
+export function openWrap(wrap: Uint8Array, held: readonly KeyObject[], committedKeyId: string): { key: Buffer; keyId: string } {
+  if (!(wrap instanceof Uint8Array)) throw wrapError('NOT_A_WRAP');
+  const b = Buffer.from(wrap.buffer, wrap.byteOffset, wrap.byteLength);
+  if (b.length < 2 || b[0] !== WRAP_FORMAT_BYTE) throw wrapError('NOT_A_WRAP');
+  if (b[1] !== WRAP_VERSION) throw wrapError('UNKNOWN_VERSION');
+  if (!WRAP_BYTES.includes(b.length)) throw wrapError('NOT_A_WRAP');
+  const named = b.subarray(2, WRAP_HEADER_BYTES);
+  const recipient = held.find((k) => {
+    const id = heldRsaKeyId(k);
+    return id !== null && Buffer.from(id, 'base64url').equals(named);
+  });
+  if (!recipient) throw wrapError('NOT_FOR_ME');
+  const ciphertext = b.subarray(WRAP_HEADER_BYTES);
+  if (ciphertext.length * 8 !== recipient.asymmetricKeyDetails?.modulusLength) throw wrapError('OPEN_FAILED');
+  let payload: Buffer;
+  try {
+    payload = privateDecrypt({ key: recipient, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, ciphertext);
+  } catch {
+    throw wrapError('OPEN_FAILED');
+  }
+  if (payload.length !== WRAP_PAYLOAD_BYTES || !payload.subarray(0, WRAP_HEADER_BYTES).equals(b.subarray(0, WRAP_HEADER_BYTES))) {
+    payload.fill(0);
+    throw wrapError('BAD_PAYLOAD');
+  }
+  // A buffer of its own, never a slice of Node's shared pool, so wiping it wipes the only copy.
+  const key = Buffer.allocUnsafeSlow(32);
+  payload.copy(key, 0, 66, 98);
+  const keyId = symmetricKeyId(key);
+  const claimed = payload.subarray(34, 66).toString('base64url');
+  payload.fill(0);
+  if (claimed !== keyId) {
+    key.fill(0);
+    throw wrapError('KEY_MISMATCH');
+  }
+  if (keyId !== committedKeyId) {
+    key.fill(0);
+    throw wrapError('NOT_COMMITTED');
+  }
+  return { key, keyId };
 }

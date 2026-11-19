@@ -12,7 +12,19 @@
  * only what is configured, so it never adds a request for a bridge with nothing set). A pairing with a
  * stored client_id may be a Reconnect, which keeps the connection's stored icon unless the pairing names
  * one, so it sends no default; an id made for this pairing (`newClientId`) is a first pairing.
+ *
+ * With no site configured, the bridge works the agent out itself (detectedAgent): the site the MCP
+ * client gives at initialize (clientInfo.websiteUrl), else what its name is (SITE_NAMES: the
+ * product's own name as a whole word), else what the connection's name is (DECOY_AGENT_NAME, the name it
+ * was approved under; with none of these, the name Decoy holds for the connection, which the owner may
+ * have renamed: identity-sync.ts syncNamedIdentity). Only a host in KNOWN_AGENTS has a site: nothing
+ * is ever guessed. That site
+ * goes with a first pairing (pairingIdentity) and, for a connection made without one, once to
+ * PATCH /api/agent/identity (identity-sync.ts syncDetectedIdentity), where Decoy takes it only from
+ * a connection that has no site yet. It never replaces a configured site or icon (detectedIdentity).
  */
+import { normalizedClientName } from './usage-report.js';
+
 
 /** The Phosphor names the server accepts for `icon`: the same list as the Decoy API's
  *  (a test checks they match). */
@@ -43,6 +55,18 @@ export const KNOWN_AGENTS: Readonly<Record<string, { uri: string; icon: AgentIco
   openai: { uri: 'https://openai.com', icon: 'sparkle' },
   gemini: { uri: 'https://gemini.google.com', icon: 'sparkle' },
   windsurf: { uri: 'https://windsurf.com', icon: 'code' },
+  // The hosts hostFamily tells apart (usage-report.ts), under the same words, so an MCP client or a
+  // connection's name finds its site here too. A host with no entry has no site the bridge sends.
+  'claude-desktop': { uri: 'https://claude.ai', icon: 'sparkle' },
+  'claude-ai': { uri: 'https://claude.ai', icon: 'sparkle' },
+  'gemini-cli': { uri: 'https://gemini.google.com', icon: 'terminal-window' },
+  vscode: { uri: 'https://code.visualstudio.com', icon: 'code' },
+  // The same sites Decoy's hosted connector names these apps by.
+  chatgpt: { uri: 'https://chatgpt.com', icon: 'chat-circle' },
+  grok: { uri: 'https://grok.com', icon: 'sparkle' },
+  muse: { uri: 'https://muse.ai', icon: 'sparkle' },
+  antigravity: { uri: 'https://antigravity.google', icon: 'code' },
+  instinct: { uri: 'https://instinct.com', icon: 'lightning' },
 });
 
 export interface AgentIdentity {
@@ -85,6 +109,97 @@ function isHttpsSite(raw: string): boolean {
     const u = new URL(raw);
     return u.protocol === 'https:' && !!u.hostname && !u.username && !u.password;
   } catch { return false; }
+}
+
+/** The longest site taken from an MCP client (Decoy's own limit for client_uri is lower still). */
+const MAX_CLIENT_SITE = 2048;
+
+/** What an MCP client says about itself at initialize (MCP `Implementation`): only these two are read. */
+export interface ClientInfoLike { name?: unknown; websiteUrl?: unknown }
+
+/** The site (and the icon shown without its favicon) the bridge worked out for the agent. */
+export interface DetectedAgent { client_uri: string; icon?: AgentIconName }
+
+/** A whole word of a client's name (normalizedClientName): never part of another word. */
+const word = (w: string) => new RegExp(`(^|[-./@])(?:${w})($|[-./@])`);
+
+/**
+ * The names that are a known agent, first match wins: the words the agents give themselves (MCP
+ * client names such as cursor-vscode, codex-mcp-client, openai-mcp, gemini-cli-mcp-client, and
+ * connection names such as Claude Code or Muse). Unlike the usage counts' hostFamily, a site is taken
+ * only from the product's own name, as a whole word: no alias for another product (Copilot, Devin,
+ * Meta AI, an xAI or OpenAI SDK) and no word inside another word.
+ */
+const SITE_NAMES: ReadonlyArray<readonly [RegExp, string]> = [
+  [word('claude-code'), 'claude-code'],
+  [word('cursor'), 'cursor'],
+  [word('codex'), 'codex'],
+  [/(^|[-./@])chatgpt($|[-./@])|^openai-mcp$/, 'chatgpt'],
+  [word('antigravity|agy'), 'antigravity'],
+  [word('gemini'), 'gemini-cli'],
+  [word('visual-studio-code|vscode'), 'vscode'],
+  [word('windsurf'), 'windsurf'],
+  [word('muse'), 'muse'],
+  [word('grok'), 'grok'],
+  [word('instinct'), 'instinct'],
+  [word('claude'), 'claude-desktop'],
+];
+
+/** The known agent a name is (SITE_NAMES), if any. The bridge's own in-process clients are none. */
+function knownByName(name: unknown): { uri: string; icon: AgentIconName } | undefined {
+  if (typeof name !== 'string' || !name.trim() || /^decoy-/i.test(name.trim())) return undefined;
+  const n = normalizedClientName(name.trim());
+  const slug = SITE_NAMES.find(([re]) => re.test(n))?.[1];
+  return slug !== undefined && Object.hasOwn(KNOWN_AGENTS, slug) ? KNOWN_AGENTS[slug] : undefined;
+}
+
+/**
+ * The agent's site, worked out with no configuration: the MCP client's own site (an https
+ * `websiteUrl`), else the known agent its name is, else the known agent the connection's name is
+ * (DECOY_AGENT_NAME). Null when none of them says: nothing is ever guessed.
+ */
+export function detectedAgent(o: { client?: ClientInfoLike | null; name?: string | null }): DetectedAgent | null {
+  const client = o.client ?? null;
+  const fromClient = knownByName(client?.name);
+  const site = typeof client?.websiteUrl === 'string' ? client.websiteUrl.trim() : '';
+  if (site && site.length <= MAX_CLIENT_SITE && isHttpsSite(site)) return { client_uri: site, ...(fromClient ? { icon: fromClient.icon } : {}) };
+  const known = fromClient ?? knownByName(o.name);
+  return known ? { client_uri: known.uri, icon: known.icon } : null;
+}
+
+/** A site is configured: a known DECOY_AGENT_FOR, or any DECOY_AGENT_URI (even one that was refused). */
+export function siteConfigured(env: Env): boolean {
+  return Object.hasOwn(KNOWN_AGENTS, (env.DECOY_AGENT_FOR ?? '').trim().toLowerCase()) || !!env.DECOY_AGENT_URI?.trim();
+}
+
+/** The agent's picture is configured: a site (siteConfigured) or an icon (any DECOY_AGENT_ICON).
+ *  Then the bridge works nothing out on its own. */
+export function identityConfigured(env: Env): boolean {
+  return siteConfigured(env) || !!env.DECOY_AGENT_ICON?.trim();
+}
+
+/**
+ * What the bridge may add on its own to the configured identity: the detected site and its icon.
+ * Null when a site is configured (a known DECOY_AGENT_FOR, or any DECOY_AGENT_URI, even one that was
+ * refused), and when an icon is (any DECOY_AGENT_ICON): Decoy shows a site's favicon before the
+ * picked icon, so a site added beside a configured icon would hide it. The configuration is never
+ * replaced.
+ */
+export function detectedIdentity(env: Env, detected: DetectedAgent | null): DetectedAgent | null {
+  if (!detected || identityConfigured(env)) return null;
+  return { client_uri: detected.client_uri, ...(detected.icon ? { icon: detected.icon } : {}) };
+}
+
+/**
+ * The identity a pairing sends: the configured one, with the detected site (and icon) added on a
+ * first pairing. A pairing that may continue a connection (a Reconnect) sends only what is
+ * configured: the owner approved that connection as it is.
+ */
+export function pairingIdentity(env: Env, detected: DetectedAgent | null, firstPairing: boolean): AgentIdentity {
+  const id = agentIdentity(env);
+  const add = firstPairing ? detectedIdentity(env, detected) : null;
+  if (!add) return id;
+  return { ...id, client_uri: add.client_uri, ...(add.icon ? { icon: add.icon } : {}) };
 }
 
 /** Who is pairing, in the body of POST /api/connect: the asks are added by pairingRequestBody (index.ts). */

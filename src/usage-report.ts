@@ -12,9 +12,12 @@ export const USAGE_RECORD_FIELDS = ['day', 'host', 'kind', 'summary_sent', 'read
 export type UsageHost = 'claude-code' | 'claude-desktop' | 'claude-ai' | 'chatgpt' | 'codex' | 'cursor' | 'gemini-cli' | 'antigravity'
   | 'vscode' | 'windsurf' | 'goose' | 'muse' | 'grok' | 'instinct' | 'other';
 
+/** A client's name as hostFamily reads it: lower case, spaces and underscores as hyphens. */
+export const normalizedClientName = (clientName: string | null | undefined): string => (clientName ?? '').toLowerCase().replace(/[\s_]+/g, '-');
+
 /** The host a client is, as one fixed word, from the name it gives in MCP initialize. */
 export function hostFamily(clientName: string | null | undefined): UsageHost {
-  const n = (clientName ?? '').toLowerCase().replace(/[\s_]+/g, '-');
+  const n = normalizedClientName(clientName);
   const rules: Array<[RegExp, UsageHost]> = [
     [/^claude-code|claude-code/, 'claude-code'],
     [/claude-ai|claude\.ai/, 'claude-ai'],

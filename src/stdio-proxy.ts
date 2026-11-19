@@ -52,6 +52,8 @@ export interface StdioProxyOptions {
   stale?: () => boolean;
   /** Put after the first answer the agent reads, once: a host may not show it the instructions. */
   firstNote?: string;
+  /** Told when the host lists or calls tools: it has initialized, whether or not it said so. */
+  onRequest?: () => void;
 }
 
 export interface StdioProxy {
@@ -109,8 +111,9 @@ export function createStdioProxy(opts: StdioProxyOptions): StdioProxy {
     await client.close().catch(() => {});
   };
 
-  server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => front().listTools(req.params, { signal: extra.signal }));
+  server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => { opts.onRequest?.(); return front().listTools(req.params, { signal: extra.signal }); });
   server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
+    opts.onRequest?.();
     if (connected && opts.stale?.()) {
       const old = connected;
       connected = null;
