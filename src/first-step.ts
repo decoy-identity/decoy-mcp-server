@@ -120,11 +120,12 @@ export function sinceLastRun(prev: ContextSeen | null, now: ContextSeen, updated
 }
 
 /** The whole output of a run that could read memories. `all`: the connection reads all memories. */
-export function contextText(o: { brief: string; since: string | null; rules?: string; all?: boolean; waiting?: string | null }): string {
+export function contextText(o: { brief: string; since: string | null; rules?: string; all?: boolean; waiting?: string | null; after?: string | null }): string {
   // Memories that are waiting on the owner's Decoy app are saved: with none to show, the run says
-  // that they are waiting, never that nothing is saved.
+  // that they are waiting, never that nothing is saved. `after`: lines that follow the summary
+  // (or that line) when it has none of its own.
   const nothing = o.waiting ? [] : [o.all ? CONTEXT_NOTHING_SAVED : CONTEXT_NOTHING_READABLE];
-  const short = [CONTEXT_LEAD, ...(o.brief.trim() ? [o.brief.trim()] : nothing), ...(o.waiting ? [o.waiting] : []), ...CONTEXT_HABITS, ...(o.since ? [o.since] : [])].join('\n');
+  const short = [CONTEXT_LEAD, ...(o.brief.trim() ? [o.brief.trim()] : nothing), ...(o.after?.trim() ? [o.after.trim()] : []), ...(o.waiting ? [o.waiting] : []), ...CONTEXT_HABITS, ...(o.since ? [o.since] : [])].join('\n');
   return o.rules ? `${short}\n\n${o.rules}` : short;
 }
 

@@ -1,5 +1,109 @@
 # Changelog
 
+## 1.8.2
+
+- **Each topic has one page.** A page is a memory filed on its topic whose title is exactly the
+  topic's name; the person's own page is a memory with no topic and no account, titled `You`.
+  Facts stay in their own memories, one fact each by default. The page explains them like a
+  Wikipedia article (a short lead, then `##` sections), links every fact filed on its topic to
+  its memory with `[words](memory:<memory_id>)`, and is updated in the same turn as the fact.
+  The person's page links memories about the person on no topic and no account; other subjects
+  go under a topic. An unmatched account name kept as a hint is excluded from page membership.
+- **One memory can be on a topic and an account.** `add_memory` accepts `app_id` together with
+  `topic`. The fact appears on the account and belongs on the topic's wiki page; a connection
+  granted either the topic or the account's memories reads it. The sealed `about` list keeps the
+  account label first, then the topic, so a client reading only the first label still shows it
+  on the account.
+- **Changing a topic keeps the account.** `update_memory` and `move_memories` preserve the account
+  label when changing the topic; `update_memory` with `topic: null` removes only the topic. The
+  existing relabel permission checks apply to each label added or removed.
+- **Results and filters keep both labels.** Memory items carry `app_id` and `topic`; `filed`
+  keeps `under: "account"` and adds the topic. The `topic` and `app_id` filters both find the
+  memory, and `list_topics` counts it among its topic's memories.
+- **An account memory is never a page.** With a topic, it counts toward that topic's
+  `not_on_page`, matches the `on_page` filter for that page, and gets the same page instruction
+  after saving. With no topic, it has no page and is excluded from the person's page counts.
+- **Hidden topic rows keep their filing.** When a topic's entity row is unreadable, its name is
+  taken only from readable topic-only observations before using the `Topic <id-prefix>` fallback.
+  An account label excludes that observation's name even without readable account metadata.
+  Generated topic names are kept separate from existing graph nodes, including accounts. A
+  malformed account or topic label excludes the whole observation from both graph and memory
+  results.
+- **A page carries no categories.** `add_memory` and `update_memory` never ask the client's model
+  to categorize a page, categories an agent sends for one are not set, and an edit that leaves a
+  memory a page removes any it had: `add_memory`, `update_memory` and `move_memories` say so in
+  `categories_not_set`. Only a connection whose grant lets it read every memory on the topic
+  (for `You`, every memory) makes a memory a page, with `add_memory`, `update_memory` or
+  `move_memories`; creating a topic is not such a grant. Only a memory this connection saved is
+  made a page (whoever saved a memory keeps reading it), and a page moved to another topic is
+  checked the same way. A page may state every fact filed on its topic. The Decoy app shows a
+  page only from the owner or a writer that holds `memory.edit` on it.
+- **`list_topics` marks each page and counts what it leaves out:** `page` (`memory_id` and
+  `updated_at`; `null` when the connection reads the whole topic and finds none; left out when it
+  cannot tell) and `not_on_page`, how many of the topic's memories the page does not link
+  (`[words](memory:<memory_id>)` in its writing, outside code and outside `## See also`; counted
+  when the connection reads the whole topic). To a connection that reads every memory, with no
+  `query`, `you` is `{ page, not_on_page }` when the person's page exists, or `{ page: null }`
+  when there are memories it would link but no page. With neither, `you` is left out. `next`,
+  the line after the first tool result's summary and `--context` say, in order: topics with no
+  page, "the person has no page" when relevant, memories not on their topic's page, and memories
+  on no topic not on the person's existing page. To a connection that may save and edit every
+  memory; with `DECOY_LISTING=true` this is an offer to the person, and the agent writes pages
+  only when they agree.
+- **`get_memories` and `search_memories` filter `{"on_page": false}`:** the memories their page
+  does not link yet, including when their page does not exist (with `topic`, one topic's; with
+  `{"topic": null}`, those on no topic). Pages themselves, account memories on no topic and
+  unmatched account names match neither `false` nor `true`.
+- **`add_memory` points at the page:** after a fact is saved on a topic that has a page, `next`
+  names the page and the link to add in the same turn; after a fact about the person is saved on
+  no topic and their page exists, it says to add it there and that a fact about a subject goes
+  under its topic. An unmatched `app_id` gets `not_linked` and, on no topic, no page instruction.
+  To a connection known to save and edit every memory; an offer to the person with
+  `DECOY_LISTING=true`.
+- **The newest guidance follows the summary of memories.** With the first tool result and in
+  `--context`, after the page counts, the bridge names the newest change to Decoy's guidance for
+  agents until this connection has been shown it. The server's instructions carry it too, and
+  `list_topics` names it. The bridge reads www.decoys.me/agent-guidance.json at most once an hour
+  on this computer with a request that carries nothing about you, and never by a one-shot run.
+  What was shown is kept per agent key in `~/.decoy/cache/`, and `--logout` removes it.
+- **`update_memory` takes `note`:** a few plain words saying what the edit changed, one line of at
+  most 200 characters, sealed with the memory beside its title. Each edit replaces it, and an edit
+  without one removes it. A note alone is not an edit, and one with no readable characters is
+  refused. The result returns the note it saved.
+- **`update_memory` that asks for what the memory already is** writes nothing and says so; a `note`
+  sent with it is not saved (`note_not_set`).
+- **A warning for files in `~/.decoy` other people can open.** At start the bridge names each file
+  or folder in `~/.decoy` that other people on this computer are allowed to open (tokens and keys
+  other tools keep there), with the command that makes it private. It does not change them itself.
+- **A selected connection keeps its identity.** A whole-connection `DECOY_CREDENTIALS_FILE`
+  preserves its original `client_id` through renewal and supports `--reconnect` with that same id
+  and key. A missing or mismatched original id stops before pairing; it never falls back to
+  another installation's default files.
+- **Credential files stay owner-only.** Files use `0600` inside private directories (`0700`). An
+  explicitly selected credential file in a directory that gives group or other users access is
+  refused; the directory's permissions stay unchanged and the bridge never falls back to default
+  files.
+- **Unsaved renewals retry with the same connection.** A renewal or approved Reconnect using
+  default or selected credential files stays in memory while its directory is nonprivate; saving
+  resumes after its owner-only permissions are restored. An ordinary selected-file renewal retries
+  under its file lock and only over the token it retired, preserving the original key, client id
+  and account.
+- **Setup verifies the approved connection.** Setup confirms an authenticated request before
+  announcing that Decoy is connected. A temporary verification failure retains the approved
+  connection and tells the agent to resume the same request without asking the person to send
+  another prompt. HTTP setup with an unsaved approval keeps running and retries verification and
+  saving automatically after network failures, timeouts or temporary HTTP errors; success waits
+  for verification.
+- **A missing favicon gets another attempt.** An approved site is tried again on a later UTC day.
+  A known provider fallback keeps the connection's chosen name and glyph during that site-only
+  retry; a site on another domain still needs Reconnect approval.
+- **The package checks its files and recovers incomplete installs.** The build checks npm's
+  actual file manifest and every local JavaScript import before packing, including files required
+  by the command-line entrypoint. If npm leaves a partial installation, the executable returns a
+  same-version, clean-cache retry command prefix. The recovery text prints no original call
+  arguments or secrets; the caller appends the arguments privately and preserves the saved
+  connection settings, key and client id.
+
 ## 1.7.0
 
 - **The Decoy app shows the agent's icon with no setting.** When no site and no icon are

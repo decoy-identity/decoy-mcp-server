@@ -45,7 +45,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID, randomBytes, type KeyObject } from 'node:crypto';
 import { keyIdFromSpki } from './key-format.js';
-import { readSecretFile, writeSecretFile, writeSecretFileIn, readSecretFileIn, removeLeftoverTemps, withFileLock, LOCK_STALE_MS, LockError, type NotHeld, SecretFileError, SecretDirError } from './secret-file.js';
+import { readSecretFile, writeSecretFile, writeSecretFileIn, readSecretFileIn, removeLeftoverTemps, withFileLock, LOCK_STALE_MS, LockError, type NotHeld, SecretFileError, SecretDirError, findLooseModes, looseModeWarning } from './secret-file.js';
 import { parseSavedCredentials, parseKeyFile, serializeCredentials, savedKeyFingerprint, isTokenShaped, type AgentKeyPair, type SavedCredentials } from './credentials.js';
 import { DEFAULT_API_URL } from './api-config.js';
 
@@ -142,10 +142,11 @@ export function serializeBoundCredentials(b: BoundCredentials): string {
 export type ConnectionSource = 'files' | 'environment' | 'environment-token' | 'credentials-file' | 'none';
 
 /** What DECOY_CREDENTIALS_FILE holds when it is the whole connection: the saved files' fields in one object. */
-export function serializeWholeConnection(accessToken: string, refreshToken: string | undefined, apiHost: string, keyPair: AgentKeyPair): string {
+export function serializeWholeConnection(accessToken: string, refreshToken: string | undefined, apiHost: string, keyPair: AgentKeyPair, clientId?: string): string {
   return JSON.stringify({
     access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }), api_host: apiHost,
     key_fingerprint: keyFingerprint(keyPair), publicKeySpki: publicKeyOf(keyPair.privateKeyPem), privateKeyPem: keyPair.privateKeyPem,
+    ...(clientId && { client_id: clientId }),
   }) + '\n';
 }
 
@@ -174,10 +175,10 @@ export interface Connection {
    *  one connection don't both spend the refresh token. { held: false } = another bridge holds
    *  it and didn't finish in time: re-read instead of renewing. */
   withRenewLock<T>(fn: () => Promise<T>): Promise<{ held: true; value: T } | NotHeld>;
-  /** Why the connection in use is held only in memory (an approved pairing that could not be
+  /** Why the connection in use is held only in memory (an approved pairing or renewal that could not be
    *  written), or null when it is saved. While set, the connection ends when the bridge stops. */
   unsaved(): string | null;
-  /** Try again to write a pairing held in memory (the same checks and lock as the commit). true = saved, or nothing to save. */
+  /** Try again to write a pairing or renewal held in memory (the same checks and lock as its first save). true = saved, or nothing to save. */
   retrySave(): Promise<boolean>;
   /** True for a --reconnect: pair again although a token is saved. The saved token is not
    *  touched until commitPairing. */
@@ -276,10 +277,6 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       `renews when it has a file to write the new pair to (otherwise the next start would hold a dead token). Set ${E.credentialsFile} to an absolute ` +
       `path, or unset ${E.refreshToken} and reconnect when the access token expires. ${UNCHANGED}`);
   }
-  if (opts.reconnect && fromFile) {
-    throw new CredentialSetupError(`--reconnect pairs over the files in ${dir}; the connection in the file ${E.credentialsFile} names is the host's to replace. ` +
-      `Unset ${E.credentialsFile}, then start the bridge to pair. ${UNCHANGED}`);
-  }
   if (opts.reconnect && (fromEnvironment || envToken !== undefined)) {
     throw new CredentialSetupError(`--reconnect pairs over the files in ${dir}; credentials that come from the environment are the host's to replace. ` +
       `Unset ${E.key}, ${E.accessToken} and ${E.refreshToken}${sink ? ` (and remove the file ${E.credentialsFile} names)` : ''}, then start the bridge to pair. ${UNCHANGED}`);
@@ -338,10 +335,10 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     const readSink = (): SavedCredentials | null => {
       if (!sink) return null;
       let raw: string | null;
-      try { raw = readSecretFileIn(sink); } catch (err) {
+      try { raw = readSecretFileIn(sink, { privateDirectory: true }); } catch (err) {
         if (err instanceof SecretDirError) {
           throw new CredentialSetupError(`The directory ${E.credentialsFile} is in can't be used: ${err.message}. Point ${E.credentialsFile} at a file in a ` +
-            `directory that belongs to this user (or to root) and that not everyone can write to. ${UNCHANGED}`);
+            `private, owner-only directory (mode 0700) that belongs to this user (or to root). Keep the same connection settings. ${UNCHANGED}`);
         }
         return refuseFile(err instanceof SecretFileError ? err.message : 'it could not be read');
       }
@@ -391,7 +388,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
         note(accessToken, refreshToken);
         if (!sink) { memory = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) }; return; }
         try {
-          writeSecretFileIn(sink, serializeBoundCredentials({ accessToken, refreshToken, apiHost, keyPair, supersededAccessToken: envToken!, clientId: pinnedClientId }));
+          writeSecretFileIn(sink, serializeBoundCredentials({ accessToken, refreshToken, apiHost, keyPair, supersededAccessToken: envToken!, clientId: pinnedClientId }), { privateDirectory: true });
           log(`[Decoy] Saved the renewed token to ${E.credentialsFile} (${sink}). Keep that file: it now holds the only working refresh token.`);
         } catch {
           memory = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
@@ -413,13 +410,13 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       throw new CredentialSetupError(`The file ${E.credentialsFile} names can't be used: ${why}. ${SHAPE}. ${UNCHANGED} File: ${file}`);
     };
     for (const left of removeLeftoverTemps(file)) log(`[Decoy] Removed a temp file an interrupted write left beside ${E.credentialsFile}: ${left}`);
-    type Whole = { credentials: SavedCredentials; keyPair: AgentKeyPair };
+    type Whole = { credentials: SavedCredentials; keyPair: AgentKeyPair; clientId?: string };
     const readWhole = (): Whole | null => {
       let raw: string | null;
-      try { raw = readSecretFileIn(file); } catch (err) {
+      try { raw = readSecretFileIn(file, { privateDirectory: true }); } catch (err) {
         if (err instanceof SecretDirError) {
           throw new CredentialSetupError(`The directory ${E.credentialsFile} is in can't be used: ${err.message}. Point ${E.credentialsFile} at a file in a ` +
-            `directory that belongs to this user (or to root) and that not everyone can write to. ${UNCHANGED}`);
+            `private, owner-only directory (mode 0700) that belongs to this user (or to root). Keep the same connection settings. ${UNCHANGED}`, { cause: err });
         }
         return refuse(err instanceof SecretFileError ? err.message : 'it could not be read');
       }
@@ -453,25 +450,144 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       if (typeof p.key_fingerprint === 'string' && p.key_fingerprint && p.key_fingerprint !== keyFingerprint(keyPair)) {
         return refuse('its tokens were issued for a different agent key than the one in it (key_fingerprint does not match privateKeyPem)');
       }
-      return { credentials: { access_token: p.access_token, ...(typeof p.refresh_token === 'string' && p.refresh_token ? { refresh_token: p.refresh_token } : {}) }, keyPair };
+      if (p.client_id !== undefined && (typeof p.client_id !== 'string' || !CLIENT_ID_OK.test(p.client_id))) return refuse('its client_id is not a valid stable client identity');
+      if (p.client_id && pinnedClientId && p.client_id !== pinnedClientId) return refuse(`its client_id differs from ${E.clientId}`);
+      return { credentials: { access_token: p.access_token, ...(typeof p.refresh_token === 'string' && p.refresh_token ? { refresh_token: p.refresh_token } : {}) }, keyPair,
+        ...(typeof p.client_id === 'string' && { clientId: p.client_id }) };
     };
     const first = readWhole() ?? refuse('it is not there');
     const fingerprint = keyFingerprint(first.keyPair);
+    // This file is an explicitly selected connection. Never discover an id in ~/.decoy, generate
+    // a replacement id, or tell the caller to unset the file and pair a different installation.
+    let stableClientId = first.clientId ?? pinnedClientId;
+    if (opts.reconnect && !stableClientId) {
+      throw new CredentialSetupError(`The connection in ${E.credentialsFile} has no saved client_id, so --reconnect cannot identify the earlier connection. ` +
+        `Keep ${E.credentialsFile} set and restore its original client_id from the connection's saved configuration, or set ${E.clientId} to that same original id. ` +
+        `Do not invent an id or pair through the default files: that would create a different connection. ${UNCHANGED}`);
+    }
     let last: SavedCredentials = first.credentials;         // what this process last read or saved
     let memory: SavedCredentials | null = null;             // a renewed pair that could not be written: this process only
+    let pendingPairing: SavedCredentials | null = null;
+    type Renewal = { credentials: SavedCredentials; renewedFrom: string };
+    let pendingRenewal: Renewal | null = null;
+    let unsavedWhy: string | null = null;
     note(first.credentials.access_token, first.credentials.refresh_token);
     info(`[Decoy] Using the connection in ${E.credentialsFile} (${file}).`);
     /** The file as it is now, when it still holds this process's key; null when it is gone or holds another. */
-    const current = (): Whole | 'another' | null => {
+    const current = (reportUnavailable = false): Whole | 'another' | null => {
       let now: Whole | null;
-      try { now = readWhole(); } catch { return 'another'; }
+      try { now = readWhole(); } catch (err) {
+        if (reportUnavailable && err instanceof CredentialSetupError && err.cause instanceof SecretDirError) throw err;
+        return 'another';
+      }
       if (!now) return null;
       if (keyFingerprint(now.keyPair) !== fingerprint) return 'another';
+      if (now.clientId && stableClientId && now.clientId !== stableClientId) return 'another';
+      const originalAccount = claims(first.credentials.access_token).userId, currentAccount = claims(now.credentials.access_token).userId;
+      if ((originalAccount || currentAccount) && originalAccount !== currentAccount) return 'another';
+      if (now.clientId && !stableClientId) {
+        const originalId = claims(first.credentials.access_token).tokenId, currentId = claims(now.credentials.access_token).tokenId;
+        if (now.credentials.access_token !== first.credentials.access_token && (!originalId || currentId !== originalId)) return 'another';
+        stableClientId = now.clientId; // a restored id of this same connection must survive its next renewal
+      }
       note(now.credentials.access_token, now.credentials.refresh_token);
       return now;
     };
+    const claims = (token: string): { userId?: string; tokenId?: string } => {
+      try {
+        const p = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as { tokenId?: unknown; userId?: unknown };
+        return { ...(typeof p?.tokenId === 'string' && { tokenId: p.tokenId }), ...(typeof p?.userId === 'string' && { userId: p.userId }) };
+      } catch { return {}; }
+    };
+    if (opts.reconnect && !claims(first.credentials.access_token).userId) {
+      throw new CredentialSetupError(`The connection in ${E.credentialsFile} names no Decoy account, so --reconnect cannot check the approving account. ` +
+        `Restore the original connection file before reconnecting. Keep the same file, key and client_id. ${UNCHANGED}`);
+    }
+    const keepApproved = (approved: SavedCredentials): false => {
+      memory = approved; pendingPairing = approved; pendingRenewal = null;
+      unsavedWhy = `${E.credentialsFile} could not be written; fix its directory so this bridge can save the approved connection`;
+      log(`[Decoy] Reconnect was approved but ${E.credentialsFile} could not be written. The approved connection is kept in memory and saving will be retried. Keep the same file and original client id.`);
+      return false;
+    };
+    const installPairing = (approved: SavedCredentials): boolean => {
+      let now: Whole | 'another' | null;
+      try { now = current(true); } catch (err) {
+        // Unavailable private storage is not evidence that another connection replaces this one.
+        // Keep approval in memory and recheck the original file once its directory is private again.
+        if (err instanceof CredentialSetupError && err.cause instanceof SecretDirError) return keepApproved(approved);
+        throw err;
+      }
+      const original = claims(first.credentials.access_token), saved = now && now !== 'another' ? claims(now.credentials.access_token) : null;
+      // A renewed token of the original connection is fine; another completed pairing is not.
+      if (!now || now === 'another' || (now.credentials.access_token !== first.credentials.access_token &&
+        (!original.tokenId || saved?.tokenId !== original.tokenId || saved?.userId !== original.userId))) {
+        throw new CredentialSetupError(`Another connection was saved in ${E.credentialsFile} while Reconnect was waiting. It was not overwritten. Restart to use the saved connection. ${UNCHANGED}`);
+      }
+      try {
+        writeSecretFileIn(file, serializeWholeConnection(approved.access_token, approved.refresh_token, apiHost, first.keyPair, stableClientId), { privateDirectory: true });
+        last = approved; memory = null; pendingPairing = null; pendingRenewal = null; unsavedWhy = null;
+        return true;
+      } catch { return keepApproved(approved); }
+    };
+    /** Called under the selected file's lock, and only over the exact token this renewal retired. */
+    const installRenewal = (renewal: Renewal): boolean => {
+      let now: Whole | 'another' | null;
+      try { now = current(true); } catch {
+        unsavedWhy = `${E.credentialsFile} could not be read; restore its private directory so this bridge can save the renewed connection`;
+        return false;
+      }
+      if (!now || now === 'another' || now.credentials.access_token !== renewal.renewedFrom) {
+        unsavedWhy = `${E.credentialsFile} no longer holds the token that was renewed; the replacement was not overwritten`;
+        return false;
+      }
+      try {
+        writeSecretFileIn(file, serializeWholeConnection(renewal.credentials.access_token, renewal.credentials.refresh_token, apiHost, first.keyPair, stableClientId), { privateDirectory: true });
+        last = renewal.credentials; memory = null; pendingRenewal = null; unsavedWhy = null;
+        log(`[Decoy] Saved the renewed token to ${E.credentialsFile} (${file}).`);
+        return true;
+      } catch {
+        unsavedWhy = `${E.credentialsFile} could not be written; fix its directory so this bridge can save the renewed connection`;
+        return false;
+      }
+    };
+    const retrySave = async (): Promise<boolean> => {
+      if (!pendingPairing) {
+        if (!pendingRenewal) return true;
+        const renewal = pendingRenewal;
+        try {
+          const got = await withFileLock(file, async () => pendingRenewal === renewal ? installRenewal(renewal) : !pendingRenewal, { ...opts.lock, waitMs: 0 });
+          return got.held && got.value;
+        } catch { return false; }
+      }
+      const approved = pendingPairing;
+      try {
+        const got = await withFileLock(file, async () => pendingPairing === approved ? installPairing(approved) : true, { ...opts.lock, waitMs: 0 });
+        return got.held && got.value;
+      } catch { return false; }
+    };
     return {
-      source: 'credentials-file', keyPair: first.keyPair, paths, clientId, clientIdIsNew, ...notPairing,
+      source: 'credentials-file', keyPair: first.keyPair, paths, ...notPairing,
+      clientId: () => stableClientId ?? null, clientIdIsNew: () => false,
+      reconnecting: !!opts.reconnect,
+      unsaved: () => unsavedWhy,
+      retrySave,
+      commitPairing: async (accessToken, refreshToken) => {
+        if (!opts.reconnect) return notPairing.commitPairing();
+        const originalAccount = claims(first.credentials.access_token).userId;
+        if (originalAccount && claims(accessToken).userId !== originalAccount) {
+          throw Object.assign(new CredentialSetupError(`Reconnect was approved from a different Decoy account. The selected credentials file was not changed.`), { otherAccount: true });
+        }
+        note(accessToken, refreshToken);
+        const approved = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
+        const stale = opts.lock?.staleMs ?? LOCK_STALE_MS;
+        try {
+          const got = await withFileLock(file, async () => installPairing(approved), { ...opts.lock, staleMs: stale, waitMs: stale + (opts.lock?.waitMs ?? 15_000) });
+          if (got.held) return { saved: got.value };
+        } catch (e) { if (e instanceof CredentialSetupError) throw e; }
+        memory = approved; pendingPairing = approved; pendingRenewal = null;
+        unsavedWhy = `another bridge is holding the lock on ${E.credentialsFile}; saving the approved connection will be retried`;
+        return { saved: false };
+      },
       credentials: () => {
         if (memory) return memory;
         const now = current();
@@ -486,30 +602,48 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
         last = now.credentials;
         return { adopt: now.credentials.access_token };
       },
-      canRenew: () => { const now = current(); return !memory && !!now && now !== 'another' && !!now.credentials.refresh_token; },
+      canRenew: () => { if (pendingPairing) return !!pendingPairing.refresh_token; if (pendingRenewal) return !!pendingRenewal.credentials.refresh_token; const now = current(); return !memory && !!now && now !== 'another' && !!now.credentials.refresh_token; },
       // Called inside withRenewLock: only over the token the renewal started from, and only while the file still holds this key.
       save: (accessToken, refreshToken, renewedFrom) => {
         note(accessToken, refreshToken);
+        if (pendingPairing) {
+          pendingPairing = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
+          memory = pendingPairing;
+          try { installPairing(pendingPairing); } catch { /* keep the approved connection in memory, never overwrite a replacement */ }
+          return;
+        }
         const keep = () => { memory = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) }; };
-        const now = current();
-        if (!now || now === 'another' || now.credentials.access_token !== (renewedFrom ?? last.access_token)) {
+        const renewal: Renewal = { credentials: { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) },
+          renewedFrom: pendingRenewal?.renewedFrom ?? renewedFrom ?? last.access_token };
+        const keepForRetry = () => {
+          memory = renewal.credentials; pendingRenewal = renewal;
+          unsavedWhy = `${E.credentialsFile} could not be written; restore its private directory so this bridge can save the renewed connection`;
+          log(`[Decoy] Credentials renewed but ${E.credentialsFile} could not be written. The renewed connection is kept in memory and saving will be retried. Keep the same file, key and original client id.`);
+        };
+        if (pendingRenewal) {
+          keepForRetry();
+          installRenewal(renewal);
+          return;
+        }
+        let now: Whole | 'another' | null;
+        try { now = current(true); } catch { keepForRetry(); return; }
+        if (!now || now === 'another' || now.credentials.access_token !== renewal.renewedFrom) {
           keep();
           log(`[Decoy] The file ${E.credentialsFile} names no longer holds the token that was renewed (it was replaced or removed meanwhile); the renewed token was not saved.`);
           return;
         }
         try {
-          writeSecretFileIn(file, serializeWholeConnection(accessToken, refreshToken, apiHost, first.keyPair));
+          writeSecretFileIn(file, serializeWholeConnection(accessToken, refreshToken, apiHost, first.keyPair, stableClientId), { privateDirectory: true });
           last = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
           log(`[Decoy] Saved the renewed token to ${E.credentialsFile} (${file}).`);
-        } catch {
-          keep();
-          log(`[Decoy] WARNING: could not write the renewed token to ${E.credentialsFile} (${file}). It works until this process stops; the token in ` +
-            'the file has been replaced and will be refused at the next start. Fix the path, or pair again with --reconnect on a machine that has this connection\'s key file, and choose Reconnect.');
-        }
+        } catch { keepForRetry(); }
       },
       // The lock file is made in the directory the result is written to: where it cannot be made, nothing is renewed.
       withRenewLock: (fn) => withFileLock(file, fn, opts.lock),
-      keyPairForPairing: () => { throw new CredentialSetupError(`The connection comes from the file ${E.credentialsFile} names; this bridge does not pair over it. ${UNCHANGED}`); },
+      keyPairForPairing: () => {
+        if (opts.reconnect) return first.keyPair;
+        throw new CredentialSetupError(`The connection comes from the file ${E.credentialsFile} names; use --reconnect with its original client_id to continue it. ${UNCHANGED}`);
+      },
     };
   }
 
@@ -520,10 +654,15 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   const read = (file: string): string | null => {
     try { return readSecretFile(file); }
     catch (e) {
-      if (e instanceof SecretFileError) throw new CredentialSetupError(`${file} can't be used: ${e.message}. Look at what is there, then remove or replace it. ${UNCHANGED}`);
+      if (e instanceof SecretFileError) throw new CredentialSetupError(`${file} can't be used: ${e.message}. Look at what is there, then remove or replace it. ${UNCHANGED}`, { cause: e });
       throw e;
     }
   };
+  /** Every other file or folder in ~/.decoy that other people on this computer are allowed to open (the
+   *  tokens and keys helper scripts keep here), each named with the command that makes it private. Run
+   *  after this bridge has read its own token and key, which that read makes owner-only. Changes nothing.
+   *  Logged under `quiet` as well: it reports a problem. */
+  const warnLooseModes = () => { for (const e of findLooseModes(dir)) log(looseModeWarning(e, opts.home)); };
   /** A key file as it is on disk, with its public half taken from the private key (never trusted as stored). */
   const readKey = (file: string): AgentKeyPair | null => {
     const raw = read(file);
@@ -549,6 +688,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   // from pairing. Kept as it was, and said out loud; never with a freshly made key.
   if (envToken !== undefined) {
     const keyForEnv = readKey(keyFile);
+    warnLooseModes();
     if (!keyForEnv) {
       throw new CredentialSetupError(`${E.accessToken} is set, but there is no key for it: ${keyFile} is missing and ${E.key} is not set. ` +
         'This bridge never makes a new key for an existing connection (the connection would not know it, so nothing sealed to this agent could be opened). ' +
@@ -615,6 +755,7 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
 
   const savedAtOpen = readSaved();   // first: a token file that can't be read stops the bridge before anything else is decided
   const savedKey = readKey(keyFile);
+  warnLooseModes();
   const reconnecting = !!opts.reconnect;
   note(savedAtOpen?.credentials.access_token, savedAtOpen?.credentials.refresh_token);
 
@@ -652,7 +793,8 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
 
   // ── This process's connection: what it may take from the file, and the one place it writes it ──
   let ownKey: AgentKeyPair | null = savedKey;                                    // set by a first pairing's commit
-  let memory: SavedCredentials | null = null;                                    // an approved pairing that could not be written: this process only
+  let memory: SavedCredentials | null = null;                                    // an approved pairing or renewal that could not be written: this process only
+  let memoryRenewedFrom: string | null = null;                                  // the saved token an in-memory renewal retired
   let unsavedWhy: string | null = null;                                          // …and why
   let lastToken: string | null = savedAtOpen?.credentials.access_token ?? null;   // the token this process runs on
   const ownFingerprint = () => (ownKey ? keyFingerprint(ownKey) : null);
@@ -673,10 +815,10 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
     let cur: Saved | null;
     try { cur = readSaved(); } catch { return { mismatch: true }; }   // another API host's token, or a file that can't be trusted
     if (!cur || cur.credentials.access_token === failedBearer) return null;
-    // Running on an approved pairing that could not be saved: the file still holds the token it replaced.
-    if (memory && cur.credentials.access_token === savedAtOpen?.credentials.access_token) return null;
+    // Running on a pairing or renewal that could not be saved: the file still holds the token it replaced.
+    if (memory && (cur.credentials.access_token === savedAtOpen?.credentials.access_token || cur.credentials.access_token === memoryRenewedFrom)) return null;
     if (!isOurs(cur)) return { mismatch: true };
-    memory = null; unsavedWhy = null;
+    memory = null; memoryRenewedFrom = null; unsavedWhy = null;
     lastToken = cur.credentials.access_token;
     note(cur.credentials.access_token, cur.credentials.refresh_token);
     return { adopt: cur.credentials.access_token };
@@ -743,7 +885,13 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   const install = (key: AgentKeyPair, accessToken: string, refreshToken?: string): 'saved' | { stop: string } | { cant: string } => {
     let wroteKey = false;
     try {
-      const another = (): Saved | null | 'another' => { try { return readSaved(); } catch { return 'another'; } };   // e.g. another API host's token, or a damaged file
+      const another = (): Saved | null | 'another' => {
+        try { return readSaved(); } catch (e) {
+          // A directory that becomes nonprivate cannot be read; approval still belongs in memory.
+          if (e instanceof CredentialSetupError && e.cause instanceof SecretDirError) throw e;
+          return 'another';   // e.g. another API host's token, or a damaged file
+        }
+      };
       const cur = another();
       const unchanged = cur !== 'another' && (cur?.credentials.access_token ?? null) === (savedAtOpen?.credentials.access_token ?? null);
       // Over the token this pairing was approved over, or that token renewed since; never over another connection.
@@ -777,10 +925,10 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
   const notHeld = (why: NotHeld['why']) => (why === 'held'
     ? `another bridge holds the lock on the token file (${tilde(tokenFile)}.lock) and did not release it`
     : `the lock file could not be created (${tilde(tokenFile)}.lock): check that ${tilde(dir)} can be written to by this user`);
-  /** The pairing held in memory is now on disk. */
+  /** The connection held in memory is now on disk. */
   const nowSaved = () => {
-    memory = null; unsavedWhy = null;
-    log(`[Decoy] The pairing this bridge was holding in memory is now saved (${tokenFile}).`);
+    memory = null; memoryRenewedFrom = null; unsavedWhy = null;
+    log(`[Decoy] The connection this bridge was holding in memory is now saved (${tokenFile}).`);
   };
 
   const commitPairing = async (accessToken: string, refreshToken?: string): Promise<{ saved: boolean }> => {
@@ -855,16 +1003,28 @@ export function openConnection(opts: OpenConnectionOptions): Connection {
       settle(install(ownKey, accessToken, refreshToken));
       return;
     }
+    const keepForPrivateStorage = (error: unknown): boolean => {
+      if (!ownKey || !(error instanceof SecretDirError || (error instanceof CredentialSetupError && error.cause instanceof SecretDirError))) return false;
+      memoryRenewedFrom = renewedFrom ?? lastToken;
+      memory = { access_token: accessToken, ...(refreshToken && { refresh_token: refreshToken }) };
+      lastToken = accessToken; note(accessToken, refreshToken);
+      unsavedWhy = 'the credential directory is not private; restore its owner-only permissions so this bridge can save the renewed connection';
+      log('[Decoy] Credentials renewed but the credential directory is not private. The renewed connection is kept in memory and saving will be retried after its owner-only permissions are restored.');
+      return true;
+    };
     try {
       let cur: Saved | null;
-      try { cur = readSaved(); } catch { log(`[Decoy] ${REPLACED} The renewed token was not saved.`); return; }
+      try { cur = readSaved(); } catch (error) {
+        if (!keepForPrivateStorage(error)) log(`[Decoy] ${REPLACED} The renewed token was not saved.`);
+        return;
+      }
       if (cur && !isOurs(cur)) { log(`[Decoy] ${REPLACED} The renewed token was not saved.`); return; }
       if (!cur || !ownKey || cur.credentials.access_token !== (renewedFrom ?? lastToken)) {
         log(`[Decoy] ${tokenFile} no longer holds the token that was renewed (it was replaced or removed meanwhile); the renewed token was not saved.`);
         return;
       }
       putToken(accessToken, refreshToken, ownKey);
-    } catch { log(`[Decoy] Warning: could not save the token to ${tokenFile}.`); }
+    } catch (error) { if (!keepForPrivateStorage(error)) log(`[Decoy] Warning: could not save the token to ${tokenFile}.`); }
   };
 
   const files = {

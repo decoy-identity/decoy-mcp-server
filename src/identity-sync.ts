@@ -17,16 +17,17 @@
  *
  * The site the bridge worked out itself (agent-identity.ts detectedAgent, for a connection with no
  * site configured) goes through syncDetectedIdentity: once per connection, with its own fingerprint
- * in the same record, and only to a connection that shows the robot (no favicon, no picked icon but
- * the robot). Decoy takes a site only from a connection that has none yet, or one on the same domain
+ * in the same record, and only to a connection that shows the robot, or a known provider's matching
+ * fallback on an already approved site. Decoy takes a site only from a connection that has none yet, or one on the same domain
  * as its own (lib/agent-icon-update.ts, ruling 2026-10-27 B); any other connection answers 409 and
  * keeps its site, and nothing more is sent or said. The detected icon is sent only when the
- * connection still shows the robot after that (no favicon could be fetched).
+ * connection still shows the robot after that (no favicon could be fetched). A missing favicon is
+ * retried once on a later UTC day; it is not recorded as a permanent success.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_AGENT_ICON, type AgentIdentity, type DetectedAgent } from './agent-identity.js';
+import { DEFAULT_AGENT_ICON, detectedAgent, type AgentIdentity, type DetectedAgent } from './agent-identity.js';
 import { writeSecretFile, writeSecretFileIn, readSecretFileIn } from './secret-file.js';
 
 /** A fingerprint of what the server last answered for, per connection. */
@@ -78,7 +79,7 @@ function recordFor(stateFile: IdentityStateFile | null, key: string, fingerprint
 
 export type SyncOutcome = 'nothing' | 'unchanged' | 'applied' | 'icon_only' | 'refused' | 'skipped';
 /** `kept`: the connection has a site on another domain and keeps it. */
-export type DetectedSyncOutcome = 'nothing' | 'unchanged' | 'applied' | 'kept' | 'refused' | 'skipped';
+export type DetectedSyncOutcome = 'nothing' | 'unchanged' | 'applied' | 'retry_later' | 'kept' | 'refused' | 'skipped';
 
 export async function syncIdentity(o: {
   identity: AgentIdentity;
@@ -90,6 +91,7 @@ export async function syncIdentity(o: {
   connection?: string;
   fetchImpl?: typeof fetch;
   log?: (line: string) => void;
+  now?: () => Date;
 }): Promise<SyncOutcome> {
   const log = o.log ?? ((l: string) => console.error(l));
   try {
@@ -98,8 +100,9 @@ export async function syncIdentity(o: {
     if (o.identity.icon) want.icon = o.identity.icon;
     if (!want.client_uri && !want.icon) return 'nothing';
     const host = new URL(o.agentApiUrl).host;
-    const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ v: 1, host, ...want })).digest('hex');
-    const record = recordFor(o.stateFile, keyOf(o.connection ?? ''), fingerprint);
+    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 2, host, ...want, ...extra })).digest('hex');
+    const retryToday = fp({ pending: today(o.now) });
+    const record = recordFor(o.stateFile, keyOf(o.connection ?? ''), fp({}), [retryToday]);
     const recordIt = record.keep;
     if (record.seen()) return 'unchanged';
 
@@ -119,7 +122,12 @@ export async function syncIdentity(o: {
         outcome = 'icon_only';
       }
     }
-    if (res.ok) { recordIt(); return outcome; }
+    if (res.ok) {
+      const after = await res.json().catch(() => ({})) as ConnectionShows;
+      if (want.client_uri && outcome === 'applied' && after.has_favicon === false) record.keep(retryToday);
+      else recordIt();
+      return outcome;
+    }
     if (res.status === 400 || res.status === 403) { recordIt(); return 'refused'; }
     return 'skipped';
   } catch {
@@ -130,8 +138,19 @@ export async function syncIdentity(o: {
 /** What GET /api/agent/identity says the connection shows. */
 export interface ConnectionShows { name?: unknown; icon?: unknown; has_favicon?: unknown; has_site?: unknown }
 
-/** It shows the robot: no favicon, and no picked icon but the robot. Only such a connection is changed. */
+/** It shows the robot: no favicon, and no picked icon but the robot. */
 const showsRobot = (s: ConnectionShows): boolean => s.has_favicon !== true && (s.icon === null || s.icon === undefined || s.icon === DEFAULT_AGENT_ICON);
+
+/** A known provider's fallback on a site already approved for this connection. The connection's
+ * own name, not just the current MCP host, must identify the same provider. A site-free picked
+ * icon, a renamed connection, a custom glyph or an existing favicon is kept. Only the site is
+ * resent: the server checks its approved domain before fetching; neither the glyph nor name is
+ * replaced. There is no assertion that a matching glyph was automatically chosen. */
+function showsProviderFallback(s: ConnectionShows, d: DetectedAgent): boolean {
+  if (s.has_favicon === true || s.has_site !== true || !d.icon || s.icon !== d.icon) return false;
+  const own = typeof s.name === 'string' ? detectedAgent({ name: s.name }) : null;
+  return own?.client_uri === d.client_uri && own.icon === d.icon;
+}
 
 const today = (now?: () => Date): string => (now ?? (() => new Date()))().toISOString().slice(0, 10);
 
@@ -147,13 +166,14 @@ async function readShows(o: { token: string; agentApiUrl: string; fetchImpl?: ty
 
 /**
  * Send the site the bridge worked out (agent-identity.ts detectedIdentity: already without what is
- * configured) to a connection that shows the robot, once. What the connection shows is read first
- * (GET /api/agent/identity, or `shows` when the caller read it): one with a favicon, or a picked
- * icon other than the robot, is left as it is. Then PATCH { client_uri } alone, and { icon } only
+ * configured) to a connection that shows the robot or an eligible known provider fallback.
+ * What the connection shows is read first (GET /api/agent/identity, or `shows` when the caller read
+ * it): an existing favicon or unrelated picked icon is left as it is. Then PATCH { client_uri } alone, and { icon } only
  * when the answer says it still shows the robot. A 409 (a site on another domain) leaves it as it
  * is, says nothing, and is recorded; a refusal (400, 403) is recorded. A server without the read
  * (404, 405) or without the site rule yet (503) is asked again the next day (UTC); a limit, an
- * error, an expired token or no network records nothing. Never throws, never logs.
+ * error, an expired token or no network records nothing. A successful site response without a
+ * favicon is retried on a later UTC day. Never throws, never logs.
  */
 export async function syncDetectedIdentity(o: {
   detected: DetectedAgent | null;
@@ -171,7 +191,8 @@ export async function syncDetectedIdentity(o: {
     const d = o.detected;
     if (!d?.client_uri) return 'nothing';
     const host = new URL(o.agentApiUrl).host;
-    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 1, detected: true, host, client_uri: d.client_uri, icon: d.icon ?? null, ...extra })).digest('hex');
+    // v2 reconsiders the old permanent "kept" record for a provider fallback with no favicon.
+    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 2, detected: true, host, client_uri: d.client_uri, icon: d.icon ?? null, ...extra })).digest('hex');
     const notYetToday = fp({ absent: today(o.now) });
     const record = recordFor(o.stateFile, detectedKeyOf(o.connection ?? ''), fp({}), [notYetToday]);
     if (record.seen()) return 'unchanged';
@@ -180,7 +201,7 @@ export async function syncDetectedIdentity(o: {
     if (shows === 'absent') { record.keep(notYetToday); return 'nothing'; }
     if (shows === 'refused') { record.keep(); return 'refused'; }
     if (shows === 'skip') return 'skipped';
-    if (!showsRobot(shows)) { record.keep(); return 'kept'; }
+    if (!showsRobot(shows) && !showsProviderFallback(shows, d)) { record.keep(); return 'kept'; }
 
     const send = async (body: { client_uri?: string; icon?: string }) => (o.fetchImpl ?? fetch)(`${o.agentApiUrl}/identity`, {
       method: 'PATCH',
@@ -201,6 +222,10 @@ export async function syncDetectedIdentity(o: {
       const r = await send({ icon: d.icon });
       if (!r.ok && r.status !== 400 && r.status !== 403) return 'skipped';
     }
+    // The site can be accepted while its favicon fetch fails, is limited, or is still pending.
+    // Retain one daily attempt, not a permanent success. The next run re-reads identity before
+    // doing anything, and existing favicons/customizations still win.
+    if (after.has_favicon !== true) { record.keep(notYetToday); return 'retry_later'; }
     record.keep();
     return 'applied';
   } catch {
@@ -211,7 +236,7 @@ export async function syncDetectedIdentity(o: {
 /**
  * With nothing else to go on, the site the connection's own name says: GET /api/agent/identity answers
  * the name the owner approved (or renamed the connection to) and what it shows. A connection that
- * shows the robot and whose name `known` maps to a site gets it through syncDetectedIdentity; any
+ * shows the robot or an eligible known fallback and whose name `known` maps to a site gets it through syncDetectedIdentity; any
  * other is left as it is. Asked once per connection and `table` (the known agents: a bridge that
  * knows more asks again). A server without the read yet (404, 405) is asked again the next day
  * (UTC); a limit, an error, an expired token or no network records nothing, nor does a site that did
@@ -232,7 +257,7 @@ export async function syncNamedIdentity(o: {
 }): Promise<DetectedSyncOutcome> {
   try {
     const host = new URL(o.agentApiUrl).host;
-    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 1, named: true, host, table: o.table, ...extra })).digest('hex');
+    const fp = (extra: object) => crypto.createHash('sha256').update(JSON.stringify({ v: 2, named: true, host, table: o.table, ...extra })).digest('hex');
     const absentToday = fp({ absent: today(o.now) });
     const record = recordFor(o.stateFile, namedKeyOf(o.connection ?? ''), fp({}), [absentToday]);
     if (record.seen()) return 'unchanged';
@@ -240,11 +265,15 @@ export async function syncNamedIdentity(o: {
     if (shows === 'absent') { record.keep(absentToday); return 'nothing'; }
     if (shows === 'refused') { record.keep(); return 'refused'; }
     if (shows === 'skip') return 'skipped';
-    if (!showsRobot(shows)) { record.keep(); return 'kept'; }
+    if (shows.has_favicon === true) { record.keep(); return 'kept'; }
     const detected = o.known(shows.name as string);
     if (!detected) { record.keep(); return 'nothing'; }
     const out = await syncDetectedIdentity({ detected, shows, token: o.token, agentApiUrl: o.agentApiUrl, stateFile: o.stateFile, connection: o.connection, fetchImpl: o.fetchImpl, now: o.now });
-    if (out !== 'skipped') record.keep();
+    // An alternate launch may already have tried the same detected identity today. Its
+    // "unchanged" result is not evidence a favicon landed, so do not turn it into a permanent
+    // name-only success. This path just read a missing favicon; look again on a later day.
+    if (out === 'retry_later' || out === 'nothing' || out === 'unchanged') record.keep(absentToday);
+    else if (out !== 'skipped') record.keep();
     return out;
   } catch {
     return 'skipped';

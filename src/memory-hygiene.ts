@@ -47,15 +47,25 @@ export const BRIEF_LOADING = 'Decoy memory: the summary of what is known about t
 export const BRIEF_FOOTER = '(From Decoy, once per session. Before a new task, search_memories for its subject.)';
 
 /** What the connection may do with memories, as far as the bridge has seen. null = not known. */
-export interface MemoryAbility { read: boolean; save: boolean }
+export interface MemoryAbility {
+  read: boolean; save: boolean;
+  /** It may edit every memory (`write` is all). The Decoy app shows a page only while its last
+   *  writer is the owner or a connection whose edit grant covers it (every memory, or its topic); an
+   *  edit grant on some categories or accounts never covers a page, which has neither. */
+  edit: boolean;
+}
 
-/** `access.memories` of a GET /policies answer, as two yes/no answers. */
+/** `access.memories` of a GET /policies answer, as yes/no answers. */
 export function memoryAbility(access: unknown): MemoryAbility | null {
   const m = access && typeof access === 'object' ? (access as { memories?: unknown }).memories : null;
   if (!m || typeof m !== 'object') return null;
-  const { read, save } = m as { read?: unknown; save?: unknown };
-  return { read: typeof read === 'string' && read !== 'none', save: save === true };
+  const { read, save, write } = m as { read?: unknown; save?: unknown; write?: unknown };
+  return { read: typeof read === 'string' && read !== 'none', save: save === true, edit: write === 'all' };
 }
+
+/** Whether it is worth telling a connection what pages need: it may save, and edit every memory
+ *  (so the app shows the pages it writes). */
+export const writesPages = (a: MemoryAbility | null): boolean | null => (a ? a.save && a.edit : null);
 
 /** Whether `access.memories` says the connection reads all memories (not some, and not unknown). */
 export function readsAllMemories(access: unknown): boolean {
@@ -103,8 +113,11 @@ export class MemorySession {
     /** A listed hosted connector: nothing is ever added after a result (no summary, no reminder,
      *  no first-step line); the session's numbers are still counted. */
     quiet?: boolean;
-    /** The summary (empty when there are no memories). Called at most once. */
-    brief: () => Promise<string>;
+    /** The summary (empty when there are no memories), given what the connection may do with
+     *  memories when that is known. Called at most once. */
+    brief: (ability: MemoryAbility | null) => Promise<string>;
+    /** The summary has gone out with a tool result. */
+    delivered?: () => void;
     waitMs?: number;
     wait?: (ms: number) => Promise<void>;
     /** The line that says how to set up the first step, while it is owed; null once it is not. */
@@ -169,7 +182,7 @@ export class MemorySession {
     if (MEMORY_READ_TOOLS.has(tool)) { this.brief = 'not_sent'; return; }
     this.brief = 'loading';
     this.briefDone = this.firstAbility
-      .then((a) => (a?.read ? this.opts.brief() : ''))
+      .then((a) => (a?.read ? this.opts.brief(a) : ''))
       .then((text) => { this.briefText = text.trim() ? text : null; }, () => { this.briefText = null; });
   }
 
@@ -200,6 +213,7 @@ export class MemorySession {
       if (this.briefText === null) this.brief = 'nothing_to_send';
       else {
         this.brief = 'delivered';
+        try { this.opts.delivered?.(); } catch { /* recorded or not, the summary goes out */ }
         const step = this.firstStep();
         return `${this.briefText}\n${BRIEF_FOOTER}${step ? `\n${step}` : ''}`;
       }

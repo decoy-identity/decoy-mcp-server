@@ -47,16 +47,20 @@ export function writeSecretFile(file: string, data: string, beforeRename?: (tmp:
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   tightenDirOnce(dir);
+  checkSecretDir(dir, { privateDirectory: true });
   replaceAtomically(file, data, beforeRename);
 }
 
 /**
  * A file in ~/.decoy: its contents (null if it doesn't exist), after making the file owner-only
- * (and, once per process, its directory). Opened and checked like a file in a caller-chosen directory (readThroughDescriptor):
+ * (and, once per process, its directory). The directory's privacy is checked at every read.
+ * Opened and checked like a file in a caller-chosen directory (readThroughDescriptor):
  * a link at the path is refused, never followed, and nothing is re-permissioned by path.
  */
 export function readSecretFile(file: string): string | null {
-  tightenDirOnce(path.dirname(file));
+  const dir = path.dirname(file);
+  tightenDirOnce(dir);
+  checkSecretDir(dir, { privateDirectory: true });
   return readThroughDescriptor(file, {});
 }
 
@@ -64,6 +68,8 @@ export function readSecretFile(file: string): string | null {
 export class SecretFileError extends Error {}
 
 export interface ReadInOptions {
+  /** Credential storage requires an owner-only directory; shared directories remain usable for non-secret state. */
+  privateDirectory?: boolean;
   /** The uid the file and its directory must belong to (default: this process's). */
   expectUid?: number;
   /** The platform (default: process.platform). On Windows there are no uids or mode bits to check. */
@@ -95,6 +101,7 @@ function checkSecretDir(dir: string, opts: ReadInOptions): void {
   if (!st) return;   // no directory yet: nothing to check
   const uid = opts.expectUid ?? process.getuid?.();
   if (uid !== undefined && st.uid !== uid && st.uid !== 0) throw new SecretDirError(`the directory is owned by another user (${dir})`);
+  if (opts.privateDirectory && (st.mode & 0o077) !== 0) throw new SecretDirError(`the directory is not owner-only; use a private directory with mode 0700 (${dir})`);
   if ((st.mode & 0o002) !== 0 && (st.mode & 0o1000) === 0) throw new SecretDirError(`the directory is writable by anyone and has no sticky bit (${dir})`);
 }
 
@@ -152,6 +159,61 @@ function readThroughDescriptor(file: string, opts: ReadInOptions): string | null
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** A file or folder in a credentials directory that other users are allowed to open. */
+export interface LooseEntry { path: string; kind: 'file' | 'folder' }
+
+/** Skipped by findLooseModes: the downloaded search model (nothing private in it) and Finder's own file. */
+const NOT_CREDENTIALS = new Set(['models', '.DS_Store']);
+
+/**
+ * What in `dir` other users are allowed to open (any group or other bit): the directory itself,
+ * each file in it, and each folder in it with the files in that folder. Looking only: modes come
+ * from lstat, so no file is opened, no link is followed, and nothing is re-permissioned. The
+ * directory itself may be a link (as ~/.decoy may be); the one it reaches is looked at. On
+ * Windows there are no mode bits, so nothing is reported.
+ */
+export function findLooseModes(dir: string, platform: NodeJS.Platform = process.platform): LooseEntry[] {
+  if (platform === 'win32') return [];
+  const loose = (m: number) => (m & 0o077) !== 0;
+  const found: LooseEntry[] = [];
+  try { const st = fs.statSync(dir); if (!st.isDirectory()) return found; if (loose(st.mode)) found.push({ path: dir, kind: 'folder' }); }
+  catch { return found; }
+  const look = (d: string, inFolder: boolean): void => {
+    let names: string[];
+    try { names = fs.readdirSync(d).sort(); } catch { return; }
+    for (const name of names) {
+      if (NOT_CREDENTIALS.has(name)) continue;
+      const full = path.join(d, name);
+      let st: fs.Stats;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      if (st.isFile()) { if (loose(st.mode)) found.push({ path: full, kind: 'file' }); }
+      else if (st.isDirectory() && !inFolder) { if (loose(st.mode)) found.push({ path: full, kind: 'folder' }); look(full, true); }
+    }
+  };
+  look(dir, false);
+  return found;
+}
+
+/** `p` as a person can paste it into a shell: ~/ for the home directory, any other part quoted when it
+ *  needs to be, and a control character shown as ? so a file name can't add lines to the log. */
+function shellPath(p: string, home: string): string {
+  const quote = (part: string) => {
+    const shown = part.replace(/[\x00-\x1f\x7f]/g, '?');
+    return /^[A-Za-z0-9._@%+=:,-]+$/.test(shown) ? shown : `'${shown.replace(/'/g, `'\\''`)}'`;
+  };
+  const under = home && p.startsWith(home + path.sep);
+  const parts = (under ? p.slice(home.length + 1) : p).split(path.sep).map((part) => (part ? quote(part) : part));
+  return under ? `~/${parts.join('/')}` : parts.join('/');
+}
+
+/** The warning for one entry findLooseModes found: what is open, and the command that makes it private. */
+export function looseModeWarning(entry: LooseEntry, home: string): string {
+  const p = shellPath(entry.path, home);
+  return entry.kind === 'file'
+    ? `[Decoy] Other people on this computer are allowed to open ${p}. To make it private, run: chmod 600 ${p}`
+    : `[Decoy] Other people on this computer are allowed to open the folder ${p}. To make it private, run: chmod 700 ${p}`;
 }
 
 /** A temp file younger than this may be another bridge's write in progress. */

@@ -110,6 +110,10 @@ export const DEFAULT_SUBTOPIC_RELATION = 'includes';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** An id a label inside a row may carry (`topic:<id>`, `account:<id>`): a row id, never text. */
 const LABEL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/** A malformed account or topic label rejects the whole observation, even after a valid one. */
+const validObservationLabels = (about: string[]) => about.every(label =>
+  label.startsWith('account:') ? LABEL_ID_RE.test(label.slice('account:'.length))
+    : label.startsWith('topic:') ? LABEL_ID_RE.test(label.slice('topic:'.length)) : true);
 
 // ── What a stored row says is data ──
 // A row is sealed, so the server cannot check what is inside one, and any connection that may
@@ -216,9 +220,23 @@ export interface TopicResult extends TopicRef { created: boolean; relationDefaul
 /** What a writer asks for: a topic by name or `topic:<id>`; type and link apply only when it is created. */
 export interface TopicSpec { topic: string; type?: string; link?: { to?: string; relation?: string } }
 /** A change to one memory. `topic` null = back to the user; `categories` replaces the set, `addCategories` adds. */
-export interface MemoryChange { text?: string; /** Blank clears it. */ title?: string; categories?: string[]; addCategories?: string[]; topic?: TopicSpec | null; expectedRev?: number }
+export interface MemoryChange {
+  text?: string; /** Blank clears it. */ title?: string;
+  /** One line saying what this edit changed. It belongs to this edit: a write without one removes the last. */
+  note?: string;
+  categories?: string[]; addCategories?: string[]; topic?: TopicSpec | null; expectedRev?: number;
+  /** Decides, from the memory as this edit would leave it and everything this connection reads,
+   *  whether the edit goes ahead as asked, goes ahead with no categories (`untag`), or is refused
+   *  (`refuse`, the error said). Used for pages (src/memory-pages.ts). */
+  rule?: (next: { before: MemoryRecord; title: string | undefined; topicName: string | null; topicId: string | null; topicCreated: boolean;
+    /** Whether this connection's own read grant covers every memory, or every memory on that topic
+     *  and its same-name topics (asked only when called: it reads the grants). */
+    readsWhole: () => Promise<boolean> }) => Promise<{ untag?: boolean; refuse?: string } | null> | { untag?: boolean; refuse?: string } | null;
+}
 /** `parent`: the name of the topic the memory's topic hangs under, when there is one. */
-export interface MemoryEdit { record: MemoryRecord; topic?: TopicResult | null; rotated: boolean; reconciled?: boolean; parent?: string }
+export interface MemoryEdit { record: MemoryRecord; topic?: TopicResult | null; rotated: boolean; reconciled?: boolean; parent?: string;
+  /** Nothing was written: the edit asked for what the memory already is. */
+  unchanged?: boolean }
 
 /** A relabel that would move a memory outside what this connection can write. */
 export const OUTSIDE_WRITE_SET = 'OUTSIDE_WRITE_SET';
@@ -290,10 +308,21 @@ interface NewMemory { text: string; title?: string; metadata?: Record<string, un
 
 /** A memory's optional title, sealed beside the text. Untrusted like the text: one line, no control or direction characters, capped. */
 export function cleanMemoryTitle(raw: unknown): string | undefined {
+  return cleanLine(raw, 120);
+}
+
+/** The note of the edit that last wrote a memory (update_memory `note`), sealed beside the title:
+ *  one line saying what that edit changed, cleaned like the title, at most 200 characters. */
+export function cleanEditNote(raw: unknown): string | undefined {
+  return cleanLine(raw, 200);
+}
+
+/** One line of untrusted text: no control or direction characters, at most `max` characters, cut on a word. */
+function cleanLine(raw: unknown, max: number): string | undefined {
   if (typeof raw !== 'string') return undefined;
   let out = raw.replace(/[\r\n\t]/g, ' ').replace(/(?!\u200D)[\p{Cc}\p{Cf}]/gu, '').split(/\s+/).filter(Boolean).join(' ');
-  if (out.length > 120) {
-    out = out.slice(0, 120).replace(/[\uD800-\uDBFF]$/, '');
+  if (out.length > max) {
+    out = out.slice(0, max).replace(/[\uD800-\uDBFF]$/, '');
     const space = out.lastIndexOf(' ');
     if (space > 0) out = out.slice(0, space);
   }
@@ -312,6 +341,8 @@ export interface MemoryRecord {
   text: string;
   /** Its optional title, never read from the text. */
   title?: string;
+  /** The note of the edit that last wrote it, when that edit gave one. */
+  note?: string;
   entityName: string;
   accountId: string | null;
   mine: boolean;
@@ -324,7 +355,7 @@ export interface MemoryRecord {
   categories?: string[];
   /** A place the writer named that is not a granted account (mem0's app_id), sealed in the row. */
   aboutHint?: string;
-  /** The topic it is filed under, or null (about the user, or an account). */
+  /** The topic it is filed under, or null; independent of its account. */
   topic: TopicRef | null;
   /** Its labels as sealed: 'user' | 'topic:<id>' | 'account:<id>'. */
   about: string[];
@@ -501,6 +532,20 @@ export class ContextGraph {
       nodes.set(name, node);
       return node;
     };
+    // Only topic-only observations name a hidden topic. An account observation's optional sealed
+    // name belongs to the account, even when no account node or metadata is available yet.
+    const inferredTopicNames = new Map<string, string>();
+    for (const o of opened) {
+      const ob = o.value.observation as { entityName?: unknown; content?: unknown } | undefined;
+      if (o.space || kindOf(o.value) !== 'observation' || !ob || typeof ob.content !== 'string') continue;
+      const about = (Array.isArray(o.value.about) ? o.value.about : []).filter((a): a is string => typeof a === 'string');
+      if (!validObservationLabels(about) || about.some(a => a.startsWith('account:'))) continue;
+      const topicLabel = about.find(a => a.startsWith('topic:'));
+      const named = typeof ob.entityName === 'string' && ob.entityName ? ob.entityName : null;
+      if (!topicLabel || !named || USER_NAMES.has(nameKey(named)) || nodes.get(named)?.accountId) continue;
+      const id = topicLabel.slice('topic:'.length);
+      if (!inferredTopicNames.has(id)) inferredTopicNames.set(id, named);
+    }
     const obsNode = new Map<string, Node>();
     for (const o of opened) {
       const ob = o.value.observation as { entityName?: unknown; content?: unknown } | undefined;
@@ -514,27 +559,40 @@ export class ContextGraph {
         if (node && o.space.kind === 'me' && node.accountId) continue;
         if (node && o.space.kind === 'me' && node.entity.name !== USER_ENTITY && node.topicId && topics.has(node.topicId)) topicId = node.topicId;
       } else {
-        // One topic per memory: the first label decides where it shows.
-        const about = (Array.isArray(o.value.about) ? o.value.about : []).find((a): a is string => typeof a === 'string');
-        const labelled = about?.startsWith('account:') ? labelId(about, 'account:') : about?.startsWith('topic:') ? labelId(about, 'topic:') : undefined;
-        if (labelled === null) continue; // a label that is not an id: the row is not shown anywhere
-        if (about === 'user') node = implied(USER_ENTITY);
-        else if (about?.startsWith('account:')) node = accountNode(labelled!);
-        else if (about?.startsWith('topic:')) {
-          topicId = labelled!;
-          node = byTopic.get(topicId);
-          if (!node) {
-            // Its row is not readable here: the memory's sealed name names it. A topic memory is never
-            // shown under the user (or an account), even when that name is stale or missing.
-            const usable = named && !USER_NAMES.has(nameKey(named)) && !nodes.get(named)?.accountId ? named : null;
-            node = implied(usable ?? `Topic ${topicId.slice(0, 8)}`);
-            node.topicId ??= topicId;
-            byTopic.set(topicId, node);
+        // Topic and account are independent labels. The observation stays on the account node;
+        // the topic decides its page and counts, whichever label came first.
+        const about = (Array.isArray(o.value.about) ? o.value.about : []).filter((a): a is string => typeof a === 'string');
+        if (!validObservationLabels(about)) continue;
+        const accountLabel = about.find(a => a.startsWith('account:'));
+        const topicLabel = about.find(a => a.startsWith('topic:'));
+        const accountId = accountLabel ? labelId(accountLabel, 'account:') : undefined;
+        const labelledTopic = topicLabel ? labelId(topicLabel, 'topic:') : undefined;
+        if (accountId === null || labelledTopic === null) continue;
+        let topicNode: Node | undefined;
+        if (labelledTopic) {
+          topicId = labelledTopic;
+          topicNode = byTopic.get(topicId);
+          if (!topicNode) {
+            // Its row is not readable here: infer the topic's node from a usable sealed name,
+            // otherwise its id. Keep this node separate from the memory's account node.
+            const inferred = inferredTopicNames.get(topicId);
+            let name = inferred && !nodes.get(inferred)?.accountId ? inferred : null;
+            if (!name) {
+              const fallback = `Topic ${topicId.slice(0, 8)}`;
+              name = fallback;
+              // Generated names never reuse another node, including an account or another
+              // inferred topic with the same id prefix.
+              for (let n = 2; nodes.has(name); n++) name = `${fallback} (${n})`;
+            }
+            topicNode = implied(name);
+            topicNode.topicId ??= topicId;
+            byTopic.set(topicId, topicNode);
           }
           if (!topics.has(topicId)) {
-            topics.set(topicId, { id: topicId, name: node.entity.name, type: null, mine: false, memories: 0, createdAt: o.row.created_at ?? '', rowVisible: false });
+            topics.set(topicId, { id: topicId, name: topicNode.entity.name, type: null, mine: false, memories: 0, createdAt: o.row.created_at ?? '', rowVisible: false });
           }
-        } else node = named ? implied(named) : undefined;
+        }
+        node = accountId ? accountNode(accountId) : topicNode ?? (about[0] === 'user' ? implied(USER_ENTITY) : named ? implied(named) : undefined);
       }
       if (!node) continue;
       obsNode.set(o.row.id, node);
@@ -883,22 +941,24 @@ export class ContextGraph {
   private static record(o: Opened, node: Node | undefined, topic: TopicInfo | undefined): MemoryRecord | null {
     const ob = o.value.observation as { entityName?: unknown; content?: unknown } | undefined;
     if (kindOf(o.value) !== 'observation' || !ob || typeof ob.content !== 'string') return null;
+    const about = (Array.isArray(o.value.about) ? o.value.about : []).filter((a): a is string => typeof a === 'string');
+    if (!o.space && !validObservationLabels(about)) return null;
     const entityName = node?.entity.name ?? (typeof ob.entityName === 'string' ? ob.entityName : '');
     if (!entityName) return null;
     const metadata = o.value.metadata && typeof o.value.metadata === 'object' ? o.value.metadata as Record<string, unknown> : undefined;
     const categories = Array.isArray(o.value.categories) ? (o.value.categories as unknown[]).filter((c): c is string => typeof c === 'string') : undefined;
     const aboutHint = typeof o.value.about_hint === 'string' && o.value.about_hint ? o.value.about_hint : undefined;
     const title = cleanMemoryTitle(o.value.title);
+    const note = cleanEditNote(o.value.note);
     const at = o.row.created_at ?? new Date(0).toISOString();
-    const about = (Array.isArray(o.value.about) ? o.value.about : []).filter((a): a is string => typeof a === 'string');
     return {
-      id: o.row.id, text: ob.content, ...(title ? { title } : {}), entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
+      id: o.row.id, text: ob.content, ...(title ? { title } : {}), ...(note ? { note } : {}), entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
       // A row that states no author is never taken for the owner's: this connection's own is an
       // agent's, and so is anyone else's until the server says otherwise.
       authorKind: o.row.author_kind ?? 'agent', rev: o.row.rev ?? 1,
       createdAt: at, updatedAt: o.row.updated_at ?? at, ...(metadata ? { metadata } : {}),
       ...(categories ? { categories } : {}), ...(aboutHint ? { aboutHint } : {}),
-      topic: topic ? { id: `topic:${topic.id}`, name: node?.entity.name ?? topic.name, type: topic.type } : null,
+      topic: topic ? { id: `topic:${topic.id}`, name: topic.name, type: topic.type } : null,
       about, via: o.row.via ?? [], stored: o.space ? 'space' : 'row',
     };
   }
@@ -1284,7 +1344,17 @@ export class ContextGraph {
   /** Where a memory can go, from one load: the topics this agent reaches and the accounts it can
    *  name (each by the name app_id takes), optionally only those whose name contains `query`. */
   async places(query?: string) {
+    return this.placesOf(await this.load(), query);
+  }
+
+  /** places(), the memories, and every topic by its name as stored, from one load (list_topics
+   *  marks each topic's page from them: src/memory-pages.ts). */
+  async placesAndMemories(query?: string) {
     const g = await this.load();
+    return { ...this.placesOf(g, query), records: this.recordsOf(g), named: ContextGraph.topicList(g).map(t => ({ id: t.id, name: t.name })) };
+  }
+
+  private placesOf(g: Loaded, query?: string) {
     const q = query ? nameKey(query) : '';
     return {
       topics: ContextGraph.topicList(g, query).map(t => ({
@@ -1421,7 +1491,6 @@ export class ContextGraph {
     return this.withLock(async () => {
       const g = await this.load();
       if (!items.length && !opts.attach?.length) return { written: [], attached: [], refused: [], topic: null };
-      if (opts.topic && accountId) throw new Error('A memory is about one thing: a topic or an account (app_id), not both.');
       // A duplicate add_memory files under the topic in place is only one this connection saved:
       // someone else's is reported as a duplicate and left as it is (update_memory changes it on
       // purpose). Saving it gives no right to change it: like any relabel, it must stay inside what
@@ -1453,7 +1522,7 @@ export class ContextGraph {
       if (!items.length && !attach.length) return { written: [], attached: [], refused: refused.map(a => a.id), topic: null };
       let node: { accountId: string | null; entity: { name: string } };
       let label: string;
-      if (topic) {
+      if (topic && !accountId) {
         node = { accountId: null, entity: { name: topic.name } };
         label = topic.id;
       } else {
@@ -1469,7 +1538,10 @@ export class ContextGraph {
       }
       const first = rows.length;
       for (const it of items) {
-        rows.push(ContextGraph.observationRow(node, label, it.text, { title: cleanMemoryTitle(it.title), metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint }));
+        const row = ContextGraph.observationRow(node, label, it.text, { title: cleanMemoryTitle(it.title), metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint });
+        // Account first keeps older clients that read only the first label on the account.
+        if (accountId && topic) row.value.about = row.facts.about = [label, topic.id];
+        rows.push(row);
       }
       await this.saveRows(rows);
       const now = new Date().toISOString();
@@ -1480,7 +1552,7 @@ export class ContextGraph {
           createdAt: now, updatedAt: now, ...(items[i].metadata ? { metadata: items[i].metadata } : {}),
           ...(cats ? { categories: cats } : {}), ...(r.value.about_hint ? { aboutHint: r.value.about_hint as string } : {}),
           topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null,
-          about: [label], via: ['self'], stored: 'row',
+          about: r.value.about as string[], via: ['self'], stored: 'row',
         };
       });
       const attached: MemoryRecord[] = [];
@@ -1522,7 +1594,7 @@ export class ContextGraph {
 
   /** Change one memory in place — its text, categories and/or topic — keeping its id, first-added
    *  date and every other sealed field. A topic is reused or created (its rows saved first); null
-   *  files it back under the user. With `expectedRev` (the revision the caller read) a memory
+   *  removes only its topic, keeping its account. With `expectedRev` (the revision the caller read) a memory
    *  changed since is refused, not overwritten.
    *
    *  Read & write on the memory is the whole rule, whoever saved it. A change of topic or categories
@@ -1543,7 +1615,6 @@ export class ContextGraph {
       let topic: TopicResult | null | undefined;
       const created: NewRow[] = [];
       if (change.topic !== undefined) {
-        if (record.accountId) throw new Error('This memory is about an account (app_id); it stays with the account and cannot be filed under a topic.');
         if (o.space) throw new Error('This memory is still in the older store until the user\'s Decoy app moves it; its topic can be changed after that.');
         if (change.topic === null) topic = null;
         else if (record.topic && !/^topic:/i.test(change.topic.topic.trim()) && !UUID_RE.test(change.topic.topic.trim())
@@ -1553,9 +1624,26 @@ export class ContextGraph {
           topic = this.resolveTopic(g, change.topic, created);
         }
       }
+      const nextTopic = topic === undefined ? record.topic : topic;
+      const verdict = await change.rule?.({
+        before: record, title: change.title === undefined ? record.title : cleanMemoryTitle(change.title),
+        topicName: nextTopic?.name ?? null, topicId: nextTopic?.id ?? null, topicCreated: !!topic?.created,
+        readsWhole: () => this.readsWholeIn(g, nextTopic && !topic?.created ? nextTopic.id : null),
+      });
+      if (verdict?.refuse) throw new Error(verdict.refuse);
+      if (verdict?.untag) change = { ...change, categories: [], addCategories: [] };
       // Before anything is written (a new topic included): the memory must stay inside what this
       // connection can write.
-      const perms = await this.assertInsideWriteSet(record, ContextGraph.nextLabels(record, change, topic), topic?.created ? [topic.id] : []);
+      let perms: ServedPermission[] | null;
+      try {
+        perms = await this.assertInsideWriteSet(record, ContextGraph.nextLabels(record, change, topic), topic?.created ? [topic.id] : []);
+      } catch (err) {
+        // The categories this edit removes are the page's: say so, beside what the refusal asks for.
+        if (verdict?.untag && (record.categories?.length ?? 0) > 0 && (err as { code?: string }).code === OUTSIDE_WRITE_SET && err instanceof Error) {
+          err.message += ' This memory is a page, and a page carries no categories, so this edit removes the ones it has; that needs edit access to them.';
+        }
+        throw err;
+      }
       if (created.length) await this.saveRows(created);
       // Where the memory's topic hangs, for the result's `filed`.
       const filedUnder = topic === undefined ? record.topic : topic;
@@ -1576,6 +1664,7 @@ export class ContextGraph {
         const landed = now && now.rev > record.rev
           && (change.text === undefined || now.text === change.text)
           && (change.title === undefined || now.title === cleanMemoryTitle(change.title))
+          && now.note === cleanEditNote(change.note)
           && (topic === undefined || (now.topic?.id ?? null) === (topic?.id ?? null));
         if (!landed) throw outcomeUnknown(id);
         return { record: now, rotated: false, reconciled: true, ...(topic !== undefined ? { topic } : {}), ...(parent ? { parent } : {}) };
@@ -1595,8 +1684,12 @@ export class ContextGraph {
     let categories = record.categories ?? [];
     if (change.categories) categories = [...new Set(change.categories)];
     if (change.addCategories?.length) categories = [...new Set([...categories, ...change.addCategories])];
-    const current = record.topic?.id ?? (record.accountId ? `account:${record.accountId}` : 'user');
-    const about = topic !== undefined && (topic?.id ?? 'user') !== current ? [topic ? topic.id : 'user'] : record.about;
+    let about = record.about;
+    if (topic !== undefined) {
+      about = record.about.filter(a => !a.startsWith('topic:') && a !== 'user');
+      if (topic) about.push(topic.id);
+      if (!about.length) about = ['user'];
+    }
     return { categories, about };
   }
 
@@ -1613,6 +1706,39 @@ export class ContextGraph {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Whether this connection's own read grant covers every memory, or every memory on the topic `ref`
+   * names and on each topic of the same name it can see (a page is one per name). `ref` is resolved
+   * as a save resolves it (`topic:<id>` exactly, a name to the oldest); null, or a topic not made
+   * yet, needs a grant on every memory. A topic it created gives no such grant: it reads only what it
+   * saved there. Grants that cannot be read are a GRANTS_UNREADABLE error, never a "no".
+   */
+  async readsWhole(ref: string | null): Promise<boolean> {
+    const g = await this.load();
+    const found = ref === null ? null : ContextGraph.findTopic(g, ref);
+    return this.readsWholeIn(g, found ? `topic:${found.id}` : null);
+  }
+
+  /** The name of the topic `ref` names, as a save resolves it; null when this connection reaches none. */
+  async topicNameOf(ref: string): Promise<string | null> {
+    return ContextGraph.findTopic(await this.load(), ref)?.name ?? null;
+  }
+
+  private async readsWholeIn(g: Loaded, ref: string | null): Promise<boolean> {
+    let perms: ServedPermission[];
+    try { perms = await this.ownPerms(); } catch (err) {
+      if ((err as { code?: string }).code === 'GRANTS_UNREADABLE' && err instanceof Error) {
+        err.message = 'Decoy could not read this connection\'s grants, so it could not check that it may write this page. Nothing was saved or changed; try again.';
+      }
+      throw err;
+    }
+    const s = ownSelectors(perms, 'read');
+    if (s.all) return true;
+    const found = ref === null ? null : ContextGraph.findTopic(g, ref);
+    if (!found) return false;
+    return [...g.topics.values()].filter(t => nameKey(t.name) === nameKey(found.name)).every(t => s.topics.includes(`topic:${t.id}`));
   }
 
   /** This connection's own grants, or a refusal that nothing was changed. */
@@ -1673,22 +1799,27 @@ export class ContextGraph {
     if (change.title !== undefined) {
       // Setting the title it already has, and nothing else: no write, no new revision.
       const titleOnly = change.text === undefined && !change.categories && !change.addCategories?.length && topic === undefined;
-      if (titleOnly && nextTitle === record.title) return { record, rotated: false };
+      if (titleOnly && nextTitle === record.title) return { record, rotated: false, unchanged: true };
       if (nextTitle) value.title = nextTitle;
       else delete value.title;
     }
+    // The note says what this edit changed, so every write replaces it, and one without a note removes it.
+    const nextNote = cleanEditNote(change.note);
+    if (nextNote) value.note = nextNote;
+    else delete value.note;
     const oldCats = record.categories ?? [];
-    const cats = ContextGraph.nextLabels(record, change, topic).categories;
+    const { categories: cats, about } = ContextGraph.nextLabels(record, change, topic);
     if (change.categories || change.addCategories?.length) value.categories = cats;
-    if (topic !== undefined && (topic?.id ?? 'user') !== (record.topic?.id ?? (record.accountId ? `account:${record.accountId}` : 'user'))) {
-      value.about = [topic ? topic.id : 'user'];
-      ob.entityName = topic ? topic.name : USER_ENTITY;
+    if (topic !== undefined) {
+      value.about = about;
+      if (record.accountId) delete ob.entityName; // account names are always resolved locally
+      else ob.entityName = topic ? topic.name : USER_ENTITY;
     }
     value.observation = ob;
     const newAbout = (Array.isArray(value.about) ? value.about : []).filter((a): a is string => typeof a === 'string');
     const result = (rev: number, updatedAt: string): MemoryRecord => ({
-      ...record, text, title: nextTitle, rev, updatedAt, categories: cats, about: newAbout,
-      ...(topic !== undefined ? { topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null, entityName: topic ? topic.name : USER_ENTITY } : {}),
+      ...record, text, title: nextTitle, note: nextNote, rev, updatedAt, categories: cats, about: newAbout,
+      ...(topic !== undefined ? { topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null, entityName: record.accountId ? record.entityName : topic ? topic.name : USER_ENTITY } : {}),
     });
 
     if (o.space) {

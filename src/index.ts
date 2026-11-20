@@ -58,7 +58,7 @@ import { hostMatches, hostOf, urlHostMatches, looksLikeHost, siteHost } from './
 import { resolveApiConfig, pairingPageUrl, parsePort, ConfigError, type ApiConfig } from './api-config.js';
 import { ContextGraph, registerMemoryTools, sealBytesForRecipient, oneLine, type ApiCall, type MemoryRecord } from './context-graph.js';
 import { AccountFields, NoSuchFieldError } from './account-fields.js';
-import { MemorySession, memoryAbility, readsAllMemories, MEMORY_SAVE_TOOLS, type MemoryCounts } from './memory-hygiene.js';
+import { MemorySession, memoryAbility, readsAllMemories, writesPages, MEMORY_SAVE_TOOLS, type MemoryCounts } from './memory-hygiene.js';
 import { apiFailure, pairingStartFailure, noAnswer, serverSaid, WRITE_OUTCOME_UNKNOWN, ASK_ACTIONS, isRouteMissing, recordUnreadable, readDidNotComplete, ACCOUNT_SECRET_KINDS, KNOWN_CODES, type AccountSecretKind, type ApiFailure } from './api-error.js';
 import { openConnection, keyFingerprint, CONNECTION_ENV, RENEW_REQUEST_TIMEOUT_MS, type Connection } from './connection.js';
 import { openSessionStore, sessionDir, countsOf, afterRun, removeSessionFiles, SESSION_ENV, type SessionStore } from './session-state.js';
@@ -71,6 +71,8 @@ import { contextSeenStore, memoriesSeen, noMemoriesSeen, CONTEXT_SEEN_FILE, type
 import { contextText, noMemoryAccessText, sinceLastRun, firstStepLine, bridgeUpdateLine, withUpdateLine, launchCommand, contextNotPaired, contextMisconfigured, CONTEXT_UNAVAILABLE, CONTEXT_TIMED_OUT,
   CONTEXT_REQUEST_TIMEOUT_MS, CONTEXT_DEADLINE_MS, CONTEXT_NAMES_RESERVE_MS } from './first-step.js';
 import { Mem0Memories, registerMem0Tools, parseImport, importMemories, memoryDigest, TOPIC_TOOLS, GRAPH_WRITE_TOOLS } from './mem0-tools.js';
+import { guidanceFeed, guidanceSeenStore, guidanceSeenFileName, dueGuidance, GUIDANCE_SEEN_FILE, GUIDANCE_LATEST_FILE, type GuidanceFeed, type GuidanceSeenStore } from './agent-guidance.js';
+import { onPage, pageCounts, pageMarks, pagesLine, youMark } from './memory-pages.js';
 import { lazyMemoryEngine, BasicEngine, type MemoryEngineLike, type Sampler } from './memory-engine.js';
 import { openEmbeddingCache, embeddingCacheFile, type EmbeddingCache } from './embedding-cache.js';
 import { MODEL_REPO, MODEL_REVISION } from './model-pin.js';
@@ -239,10 +241,11 @@ const FIRST_SAVE = "save everything you know about this person, each memory file
   "marked as yours (no guesses about health, sex life, religion or politics they haven't told you)";
 /** What the answers to a new pairing say to do once it is approved: a tool result is always read,
  *  while a host may cut or drop the server's instructions. */
-const AFTER_NEW_PAIRING = `Tell the person only "${SETUP_DONE}" Then ${FIRST_SAVE}. Then retry this request.`;
+const AFTER_NEW_PAIRING = `Retry this request now to verify the approved connection; keep retrying in this conversation without waiting for another prompt. Only after an authenticated request succeeds, tell the person "${SETUP_DONE}" Then ${FIRST_SAVE}. Then retry the original request.`;
+const AFTER_APPROVAL = `Retry this request now without waiting for another prompt. Only after an authenticated request succeeds, say "${SETUP_DONE}" and continue the original request.`;
 /** The --no-browser line on stdout: the link, and the words that go with it. */
 export function pairingSignal(url: string, code: string, expiresAt: string | null) {
-  return { decoy_pairing: { url, code, expires_at: expiresAt, say: `${SETUP_SAY}\n${url}`, after_approval: SETUP_DONE } };
+  return { decoy_pairing: { url, code, expires_at: expiresAt, say: `${SETUP_SAY}\n${url}`, after_approval: AFTER_APPROVAL } };
 }
 /** The 503 a call gets before Decoy is connected. `firstSave`: the pairing is a new connection
  *  (firstSaveDue), so once approved the agent saves what it knows before it retries. */
@@ -250,10 +253,10 @@ export function notPairedBody(url: string, firstSave = false) {
   return {
     error: 'not_paired',
     message: `Decoy is not connected yet. Say exactly "${SETUP_SAY}" with pairing_url on its own line (the text in \`say\`), with no question before it, and never ask the person for a token. ` +
-      (firstSave ? `Once they approve: ${AFTER_NEW_PAIRING}` : `Once they approve, say "${SETUP_DONE}" and retry this request.`),
+      `Once they approve: ${firstSave ? AFTER_NEW_PAIRING : AFTER_APPROVAL}`,
     pairing_url: url,
     say: `${SETUP_SAY}\n${url}`,
-    after_approval: SETUP_DONE,
+    after_approval: firstSave ? AFTER_NEW_PAIRING : AFTER_APPROVAL,
   };
 }
 
@@ -396,6 +399,7 @@ function envOrSavedToken(): string | null {
 /** Save a renewed pair: only over the token it was renewed from, and only into this process's own connection. */
 function saveToken(token: string, refreshToken: string | undefined, renewedFrom: string): void {
   connection().save(token, refreshToken, renewedFrom);
+  retryUnsavedConnection();
 }
 
 // Serialized so two concurrent 401s don't race the rotation (a used refresh
@@ -685,16 +689,48 @@ async function runBrowserPairing(keyPair: AgentKeyPair): Promise<string> {
   }
   if (!saved) {
     // Not written: keep trying while this process runs (the same checks and lock as the commit).
-    const timer = setInterval(() => { void connection().retrySave().then((done) => { if (done) clearInterval(timer); }).catch(() => {}); }, SAVE_RETRY_MS);
-    timer.unref();
-    return accessToken;
+    retryUnsavedConnection();
   }
+  // HTTP has no next tool call to resume setup. Keep its only approved connection alive while
+  // verification is temporarily unavailable; the independent save timer keeps trying too.
+  await verifyApprovedConnection(accessToken, !STDIO_RUN && !saved);
+  if (connection().unsaved()) return accessToken;
   console.error(SETUP_DONE);
-  console.error('   (For this machine, not for the person:) token saved to', TOKEN_FILE);
-  console.error(`   Keep ${TOKEN_FILE} and ${KEY_FILE} to stay connected: with both, no later session needs to pair again.`);
+  const c = connection();
+  console.error('   (For this machine, not for the person:) connection saved to', c.paths.credentialsFile ?? TOKEN_FILE);
+  console.error(c.paths.credentialsFile
+    ? `   Keep ${c.paths.credentialsFile} to stay connected; it holds this connection's key and tokens.`
+    : `   Keep ${TOKEN_FILE} and ${KEY_FILE} to stay connected: with both, no later session needs to pair again.`);
   if (clientId) console.error('   Back up the key file: this bridge does not continue a connection with a different key. If only the token is lost, `npx decoy-mcp-server --reconnect` pairs again and the Decoy app offers to continue this connection.');
   console.error('   Everything the owner approved is this connection\'s to use — call my_permissions to see all of it.');
   return accessToken;
+}
+
+/** Approval is a saved grant, not proof that the new token works. Keep the approved connection
+ *  on a temporary failure and retry it; never start a second pairing to test it. */
+let verifiedPairingToken: string | null = null;
+async function verifyApprovedConnection(token: string, retryTemporary = false): Promise<void> {
+  if (verifiedPairingToken === token) return;
+  for (;;) {
+    let temporary = true; // A network error or timeout can be retried on the same token.
+    try {
+      const response = await decoyFetch(`${AGENT_API_URL}/policies`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(RENEW_REQUEST_TIMEOUT_MS) });
+      if (!response.ok) {
+        temporary = response.status >= 500 || response.status === 408 || response.status === 429;
+        await response.body?.cancel();
+        throw new Error('not accepted');
+      }
+      await response.body?.cancel();
+      verifiedPairingToken = token;
+      return;
+    } catch {
+      if (!retryTemporary || !temporary) {
+        throw new Error('Access was approved, but Decoy has not confirmed the connection works yet. Retry this request in this conversation using the approved connection; do not start another pairing or wait for another prompt.');
+      }
+      console.error('[Decoy] Access was approved, but Decoy has not confirmed the connection works yet. Keeping this process and the approved connection; retrying verification and any pending save automatically.');
+      await new Promise((resolve) => setTimeout(resolve, SAVE_RETRY_MS));
+    }
+  }
 }
 
 async function resolveToken(c: Connection): Promise<string> {
@@ -721,9 +757,25 @@ function knownTokens(): Array<string | undefined> {
 }
 /** One line for every tool result while the connection is held only in memory. */
 const unsavedNotice = (cause: string) =>
-  `Note from the Decoy bridge: this connection is not saved on this computer yet; the bridge keeps retrying and will save by itself once this is fixed: ${cause}; if the bridge stops before then, pair again.`;
+  `Note from the Decoy bridge: this connection is not saved on this computer yet; the bridge keeps retrying and will save by itself once this is fixed: ${cause}. If it stops before saving, keep the same launch configuration and restore the original connection's key and client id before using --reconnect. Keep DECOY_CREDENTIALS_FILE set when it selects this connection; never switch to default files or create another identity to recover.`;
 /** How often a pairing held in memory is tried again. */
 const SAVE_RETRY_MS = 30_000;
+let saveRetryTimer: ReturnType<typeof setInterval> | null = null;
+/** Both approved pairings and renewed tokens get one retry loop; it never keeps a run alive. */
+function retryUnsavedConnection(): void {
+  if (READ_ONLY_RUN || saveRetryTimer) return;
+  const c = connection();
+  if (!c.unsaved()) return;
+  const timer = setInterval(() => {
+    void c.retrySave().then((done) => {
+      if (!done) return;
+      clearInterval(timer);
+      if (saveRetryTimer === timer) saveRetryTimer = null;
+    }).catch(() => {});
+  }, SAVE_RETRY_MS);
+  saveRetryTimer = timer;
+  timer.unref();
+}
 /** One line on the next tool result when the access this bridge last saw is no longer the access it has. */
 export const ACCESS_CHANGED_NOTICE = 'Your access changed since you last checked: call my_permissions.';
 /** A refusal for missing access makes the bridge look at its access again, at most this often. */
@@ -1095,6 +1147,12 @@ export interface ServerDeps {
   instructionsNote?: string;
   /** The name the host gave in MCP initialize, when this server sits behind a front (--stdio). */
   hostName?: () => string | undefined;
+  /** Decoy's guidance file (src/agent-guidance.ts); null reads none. Default: www.decoys.me's, when
+   *  this file is the program being run and talks to Decoy's own API; none for a server given its
+   *  own `call`, and none when the module is imported (a test). */
+  guidance?: GuidanceFeed | null;
+  /** What guidance change this connection was last shown. Default: kept per agent key in the cache folder. */
+  guidanceSeen?: GuidanceSeenStore;
 }
 
 // Top-level guidance shown to the connecting LLM at `initialize`: the one block of prose the agent
@@ -1133,7 +1191,7 @@ const MUST_KNOW = `
 MUST KNOW:
 ${SECRETS_RULE}
 ${SENDER_RULE}
-- "Not paired" / HTTP 503: say exactly "Tap to connect Decoy:" with its pairing_url on its own line, with no question before it; never ask for a token or to paste anything. Once they approve, say "Connected to Decoy." and retry the call. Say nothing else about connecting; handle limits silently, and speak only when the person must act.
+- "Not paired" / HTTP 503: say exactly "Tap to connect Decoy:" with pairing_url on its own line, no question before it; never ask for a token or to paste anything. After approval, retry here without another prompt. Say "Connected to Decoy." only after an authenticated request succeeds; then continue. Speak only when the person must act.
 - Missing access (403): request_access, never a new pairing.`;
 
 const MEMORY_INSTRUCTIONS = `
@@ -1144,7 +1202,7 @@ YOUR VAULT (memories, accounts, personal info and Decoy emails; the person choos
 - WRITE AS YOU GO, NOT ONLY AT THE END: a rule for how they want work done counts too, and sensitive facts are saved like any other. Also what lasts: a decision and why, a fact about an account, where things stand; not raw attempts or working notes. Save at natural checkpoints, again at the end, and daily at least. Sessions end abruptly. Saving needs the memory.save permission; if it is missing, ask once with request_access({ permissions: ["memory.save"] }).
 - ONE MEMORY, ONE FACT: readable on its own: who said or decided it and when (not when saved), the reason, the status.
 - Don't save: instructions for only the current task, secrets (passwords, codes, card numbers), guesses stated as facts, or anything already in the summary. Nor transcripts or repository contents.
-- ALWAYS ORGANISE: give every memory every category that fits (misc only when no other fits) and one place: the account it is about, a topic, or neither (add_memory says which, in order; its result says where it landed: \`filed\`). For a topic, list_topics first and reuse what fits (prefer a broader existing topic; don't make a topic for every noun). Create one only when none fits, and say how it connects (topic_link): the relation that is true and specific for this person and subject, not a stock phrase; for health, money, legal or relationship subjects it says no more than the topic's name does. Topics make a web: when two or more topics share a subject, create the broader topic first and the others under it; set_topic_parent moves one later.
+- ALWAYS ORGANISE: give every memory every category that fits (misc only when no other fits) and file it by account, topic, both or neither (add_memory says where; its result says where it landed: \`filed\`). For a topic, list_topics first and reuse what fits (prefer a broader existing topic; don't make a topic for every noun). Create one only when none fits, and say how it connects (topic_link): the relation that is true and specific for this person and subject, not a stock phrase; for health, money, legal or relationship subjects it says no more than the topic's name does. Topics make a web: when two or more topics share a subject, create the broader topic first and the others under it; set_topic_parent moves one later.
 - KEEP MEMORIES CORRECT: update_memory the original (by memory_id, with expected_rev from your read) instead of adding a contradiction; another agent's needs memory.edit. delete_memory what is wrong. Asked to forget something: delete it; say what you could not.`;
 
 // A hosted connector listed in a store directory runs with DECOY_LISTING=true. Store review
@@ -1196,6 +1254,32 @@ RESPONSE FORMAT: every tool returns one text block of JSON; a note from the brid
 
 // The summary of what's known about the user, per server (built from its own decrypted graph).
 const memoryIntros = new WeakMap<McpServer, () => Promise<string>>();
+
+/** How long a brief waits for Decoy's guidance file (ms): what has not arrived is said next time. */
+const GUIDANCE_WAIT_MS = 1500;
+/** The summary's share of the instructions (src/mem0-tools.ts memoryDigest): its lines and the brief's own lines together. */
+const BRIEF_CHARS = 1100;
+/** The brief: the summary of memories, then at most two lines: what pages need (`pages`) and
+ *  Decoy's newest guidance change (`guidance`). The summary gives them its room, so a host that cuts
+ *  the instructions short keeps them and what must be known. Neither starts with "- ", so no
+ *  memory line can pass for one. */
+export function composeBrief(records: MemoryRecord[], accountNames: Map<string, string>, lines: { pages?: string | null; guidance?: string | null }): string {
+  const extra = [lines.pages, lines.guidance].filter((l): l is string => !!l);
+  const room = extra.reduce((n, l) => n + l.length + 1, 0);
+  const digest = memoryDigest(records, accountNames, { maxChars: Math.max(0, BRIEF_CHARS - room) });
+  return [digest, ...extra].filter(Boolean).join('\n');
+}
+let sharedGuidance: GuidanceFeed | null | undefined;
+/** Decoy's guidance file, read by a bridge that talks to Decoy's own API (one pointed at another
+ *  API, such as a test server, reads none). One per process. */
+function defaultGuidance(): GuidanceFeed | null {
+  if (sharedGuidance === undefined) {
+    let host = '';
+    try { host = new URL(AGENT_API_URL).hostname; } catch { /* not a URL: none */ }
+    sharedGuidance = /(^|\.)decoys\.me$/.test(host) ? guidanceFeed({ cacheFile: path.join(embeddingCacheDir(), GUIDANCE_LATEST_FILE) }) : null;
+  }
+  return sharedGuidance;
+}
 /** Each server's session of memory habits, for a one-shot `call` to hand on its counts. */
 const memorySessions = new WeakMap<McpServer, MemorySession>();
 const memoryRules = new WeakMap<McpServer, string>();
@@ -1209,7 +1293,10 @@ const memoryRules = new WeakMap<McpServer, string>();
  *  accounts could not be listed, the summary names an account by the start of its id. */
 export async function memoryContextText(server: McpServer, opts: { full?: boolean; seen?: Pick<ContextSeenStore, 'load' | 'save'>; now?: () => number; namesBy?: number;
   /** Decoy answered: the run read the memories (`summary`: there was one to print), or found it may not read them. */
-  onRead?: (read: { memories: boolean; summary: boolean }) => void } = {}): Promise<string> {
+  onRead?: (read: { memories: boolean; summary: boolean }) => void;
+  /** Given what records the guidance change in this text as shown, for the caller to call once the
+   *  text is printed. Without it, it is recorded when the text is made. */
+  printed?: (shown: () => void) => void } = {}): Promise<string> {
   const read = contextReaders.get(server);
   if (!read) return CONTEXT_UNAVAILABLE;
   const at = new Date((opts.now ?? Date.now)());
@@ -1244,13 +1331,14 @@ export async function memoryContextText(server: McpServer, opts: { full?: boolea
     return withUpdateLine(noMemoryAccessText(ask), update);
   };
   if (ability && !ability.read) return noAccess();
-  let records: MemoryRecord[], brief: string, waiting: Waiting[];
-  try { ({ records, brief, waiting } = await read.memories(opts.namesBy ?? Infinity)); } catch (e) {
+  let records: MemoryRecord[], brief: string, after: string | null, waiting: Waiting[], shown: (() => void) | null;
+  // What pages need is said to a connection that may save and edit every memory.
+  try { ({ records, brief, after, waiting, shown } = await read.memories(opts.namesBy ?? Infinity, writesPages(ability))); } catch (e) {
     if ((e as { code?: unknown }).code === 'UPDATE_REQUIRED' && e instanceof Error) return e.message;
     return (e as { status?: number }).status === 403 ? noAccess() : CONTEXT_UNAVAILABLE;
   }
   const now = memoriesSeen(records, at, fingerprint);
-  opts.onRead?.({ memories: true, summary: !!brief.trim() });
+  opts.onRead?.({ memories: true, summary: records.length > 0 });
   let since: string | null = null;
   // The record is a convenience: a file that cannot be read or written never fails the run.
   try {
@@ -1261,10 +1349,15 @@ export async function memoryContextText(server: McpServer, opts: { full?: boolea
   } catch { /* nothing to compare with, or nothing kept */ }
   // One line, whatever is waiting: a run prints lines an agent reads top to bottom.
   const waitingLineNow = waitingText(waiting)?.replace(/\n/g, ' ') ?? null;
-  return withUpdateLine(contextText({ brief, since, all: readsAllMemories(access), waiting: waitingLineNow, ...(opts.full ? { rules: memoryRules.get(server) ?? MEMORY_INSTRUCTIONS.trimStart() } : {}) }), update);
+  const text = withUpdateLine(contextText({ brief, after, since, all: readsAllMemories(access), waiting: waitingLineNow, ...(opts.full ? { rules: memoryRules.get(server) ?? MEMORY_INSTRUCTIONS.trimStart() } : {}) }), update);
+  // The guidance change in it is shown to this connection once the text is printed.
+  if (shown) { if (opts.printed) opts.printed(shown); else shown(); }
+  return text;
 }
 /** What a `--context` run reads through a server, per server. */
-const contextReaders = new WeakMap<McpServer, { policies: () => Promise<unknown>; memories: (namesBy: number) => Promise<{ records: MemoryRecord[]; brief: string; waiting: Waiting[] }> }>();
+const contextReaders = new WeakMap<McpServer, { policies: () => Promise<unknown>; memories: (namesBy: number, save: boolean | null) => Promise<{ records: MemoryRecord[]; brief: string; after: string | null; waiting: Waiting[]; shown: (() => void) | null }> }>();
+/** The brief for the summary sent with a session's first tool result, per server, and what to record once it is sent. */
+const memoryBriefs = new WeakMap<McpServer, (save: boolean | null) => Promise<{ text: string; shown: (() => void) | null }>>();
 
 /** Put the summary of the user's memories at the top of this server's instructions. Call it
  *  before connect (instructions go out in the initialize response). Never blocks a connection:
@@ -1392,9 +1485,19 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
   // Tools whose result is read by code, not by the agent: never followed by a session note.
   const MACHINE_READ_TOOLS = new Set(['passkey_assert']);
   // One connected client's memory habits, kept in memory for as long as it is connected.
+  let briefShown: (() => void) | null = null;
   const memorySession = new MemorySession({
     quiet: listing,
-    brief: () => memoryIntros.get(server)?.() ?? Promise.resolve(''),
+    // The brief says what pages need only to a connection that may save and edit every memory; the guidance change in
+    // it is recorded as shown once the brief has gone out with a result.
+    brief: async (ability) => {
+      const make = memoryBriefs.get(server);
+      if (!make) return '';
+      const b = await make(writesPages(ability));
+      briefShown = b.shown;
+      return b.text;
+    },
+    delivered: () => { briefShown?.(); briefShown = null; },
     waitMs: deps.briefWaitMs,
     // While no --context run is recorded on this machine: how to set the first step up, once.
     firstStep: () => ((deps.firstStepRecorded ?? (deps.call ? () => true : firstStepRecorded))() ? null : firstStepLine(PACKAGE_VERSION, deps.launch === undefined ? LAUNCH : deps.launch)),
@@ -2357,27 +2460,62 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
     const closeServer = server.close.bind(server);
     server.close = async () => { try { await closeServer(); } finally { await ownedEngine.close?.(); } };
   }
-  // The summary made at connect (for the instructions) is the one sent with the first tool
-  // result: it is not fetched a second time within a few minutes.
-  let digest: { at: number; text: Promise<string> } | null = null;
-  if (!listing) memoryIntros.set(server, () => {
-    if (digest && Date.now() - digest.at < 5 * 60_000) return digest.text;
-    const made = { at: Date.now(), text: (async () => {
-      const { records, accounts } = await contextGraph.memorySnapshot();
-      return memoryDigest(records, new Map(accounts.map(a => [a.accountId, a.name])));
-    })() };
-    digest = made;
+  // Decoy's newest guidance change, said once per connection (src/agent-guidance.ts). Only the bridge
+  // run as a program reads it, and not for a one-shot run (`call`, the prompt hook, warm-up): a
+  // server given its own `call` (an in-process front) or built by an importer (a test) reads none
+  // unless it is given a feed. It is asked for now, so a call later never waits for it.
+  const guidance = deps.guidance !== undefined ? deps.guidance : deps.call || deps.oneShot || !IS_ENTRYPOINT ? null : defaultGuidance();
+  void guidance?.newest(0).catch(() => null);
+  let guidanceSeen = deps.guidanceSeen;
+  const dueGuidanceNow = (waitMs = GUIDANCE_WAIT_MS) => {
+    if (!guidance) return Promise.resolve(null);
+    if (!guidanceSeen) {
+      let fingerprint: string | null = null;
+      try { fingerprint = privateKeyPem ? keyFingerprint({ privateKeyPem, publicKeySpki: '' }) : null; } catch { /* kept in this process only */ }
+      guidanceSeen = guidanceSeenStore(fingerprint ? embeddingCacheDir() : null, fingerprint);
+    }
+    return dueGuidance(guidance, guidanceSeen, waitMs);
+  };
+  // The brief's line about pages: to a connection known to save and edit every memory, from all the memories it reads, so
+  // none while some are waiting.
+  const pagesNow = (records: MemoryRecord[], save: boolean | null) => {
+    if (save !== true || contextGraph.waiting().length) return null;
+    const linked = onPage(records);
+    return pagesLine(pageCounts(pageMarks(records, linked), youMark(records, linked)));
+  };
+  // The memories read at connect (for the instructions) are the ones the first tool result's brief
+  // is made from: they are not fetched a second time within a few minutes.
+  let snap: { at: number; data: Promise<Awaited<ReturnType<typeof contextGraph.memorySnapshot>>> } | null = null;
+  const snapshotNow = () => {
+    if (snap && Date.now() - snap.at < 5 * 60_000) return snap.data;
+    const made = { at: Date.now(), data: contextGraph.memorySnapshot() };
+    snap = made;
     // A failed one is not kept. Nor is one made while memories are waiting: it is not all of them.
-    made.text.then(() => { if (contextGraph.waiting().length && digest === made) digest = null; }, () => { if (digest === made) digest = null; });
-    return made.text;
-  });
+    made.data.then(() => { if (contextGraph.waiting().length && snap === made) snap = null; }, () => { if (snap === made) snap = null; });
+    return made.data;
+  };
+  const briefOf = async (save: boolean | null) => {
+    const [{ records, accounts }, due] = await Promise.all([snapshotNow(), dueGuidanceNow()]);
+    const text = composeBrief(records, new Map(accounts.map(a => [a.accountId, a.name])), { pages: pagesNow(records, save), guidance: due?.line });
+    return { text, shown: due?.shown ?? null };
+  };
+  if (!listing) {
+    // The instructions go out before the access is known: what pages need is said later, to a
+    // connection that may save and edit every memory (the first result's summary, --context, list_topics).
+    memoryIntros.set(server, async () => (await briefOf(null)).text);
+    memoryBriefs.set(server, briefOf);
+  }
   contextReaders.set(server, {
     policies: () => apiCall('/policies'),
-    memories: async (namesBy) => {
+    memories: async (namesBy, save) => {
       contextNamesBy = namesBy;
       try {
-        const { records, accounts } = await contextGraph.memorySnapshot();
-        return { records, brief: memoryDigest(records, new Map(accounts.map(a => [a.accountId, a.name]))), waiting: contextGraph.waiting() };
+        const [{ records, accounts }, due] = await Promise.all([contextGraph.memorySnapshot(), dueGuidanceNow()]);
+        // With nothing to show, the run still says so: the lines come after that line, not instead of it.
+        const lines = { pages: pagesNow(records, save), guidance: due?.line };
+        const brief = records.length ? composeBrief(records, new Map(accounts.map(a => [a.accountId, a.name])), lines) : '';
+        const after = records.length ? null : [lines.pages, lines.guidance].filter(Boolean).join('\n') || null;
+        return { records, brief, after, waiting: contextGraph.waiting(), shown: due?.shown ?? null };
       } finally { contextNamesBy = null; }
     },
   });
@@ -2387,12 +2525,19 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
   registerMem0Tools(server, mem0Memories, {
     listing,
     canSample: deps.canSample ?? (() => !!server.server.getClientCapabilities()?.sampling),
-    onChange: () => { digest = null; memoryTools.notifyGraphUpdated(); },
+    onChange: () => { snap = null; memoryTools.notifyGraphUpdated(); },
     onSave: () => memorySession.saved(),
     include: memoryInclude,
     retry: waitingRetry,
     // list_topics names each account's site beside its name (the list is the one read above, cached).
     accountSites: async () => new Map((accountNamesCache?.list ?? []).map(a => [a.id, a.site])),
+    // What pages need goes only to a connection known to save and edit every memory (the app shows only such pages).
+    mayWrite: async () => {
+      const a = await Promise.race([memorySession.abilityNow(), new Promise<null>((r) => { const t = setTimeout(() => r(null), 300); t.unref?.(); })]);
+      return writesPages(a);
+    },
+    // list_topics never waits for the file: what has not arrived is said the next time.
+    guidance: () => dueGuidanceNow(0),
   });
   // Saving what the bridge itself did: an account it created, or a login it saved as a new
   // account. On unless DECOY_MEMORY_SAVE_EVENTS=false. The memory is one fact with its date and
@@ -2413,7 +2558,7 @@ export function buildMcpServer(agentToken: string, privateKeyPem?: string, deps:
       accountNamesCache = null; // the account was made a moment ago: the list of names is read again
       const r = await mem0Memories.add({ text, account_id: accountId }, false);
       if (!r.results.length) return null;
-      digest = null;
+      snap = null;
       memoryTools.notifyGraphUpdated();
       return `Decoy memory saved: ${text}`;
     } catch { return null; }
@@ -5916,22 +6061,29 @@ async function runCredentialsFileLogout(): Promise<boolean> {
 }
 
 /** A connection that is not the saved one (the environment's, a credentials file's): its own kept
- *  vectors go at logout; ~/.decoy's other files belong to the saved connection and stay. */
+ *  vectors and its record of the guidance it was shown go at logout; ~/.decoy's other files belong
+ *  to the saved connection and stay. */
 function removeOwnCacheFile(keyPair: Connection['keyPair'] | undefined): void {
   if (!keyPair) return;
   try {
     const f = embeddingCacheFile({ dir: embeddingCacheDir(), privateKeyPem: keyPair.privateKeyPem, model: EMBEDDING_MODEL_NAME });
     if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); console.error('[Decoy] Removed', f); }
   } catch (e) { console.error('[Decoy] Could not remove the kept search vectors', e); }
+  try {
+    const f = path.join(embeddingCacheDir(), guidanceSeenFileName(keyFingerprint(keyPair)));
+    if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); console.error('[Decoy] Removed', f); }
+  } catch (e) { console.error('[Decoy] Could not remove the record of the guidance shown', e); }
 }
 
-/** The kept vectors of the local search (every key and model: they are only a cache) and the
+/** The kept vectors of the local search (every key and model: they are only a cache), each key's
+ *  record of the guidance it was shown, and the
  *  hooks' per-session records: only files named the way this bridge names them, then each folder
  *  when nothing else is left in it. */
 function removeCacheAndHookRecords(): void {
   const hookFile = /^([0-9a-f]{32}\.json(\.\d+\.tmp)?|warm\.lock)$/;
   const folders: Array<[string, RegExp]> = [
     [embeddingCacheDir(), /^embeddings-[0-9a-f]{24}\.bin(\.\d+\.tmp)?$/],
+    [embeddingCacheDir(), GUIDANCE_SEEN_FILE], // each key's record and the last answer kept
     ...[...new Set([path.join(path.dirname(TOKEN_FILE), 'hooks'), hookStateDir()])].map((d): [string, RegExp] => [d, hookFile]),
   ];
   for (const [dir, own] of folders) {
@@ -6010,7 +6162,7 @@ async function runImport(file: string): Promise<void> {
   console.error(`[Decoy] Importing ${data.memories.length} memories, ${data.entities.length} topics, ${data.relations.length} connections from ${file}`);
   const engine = lazyMemoryEngine();
   process.env.DECOY_MEMORY_GRAPH = 'true';   // topics and connections come in through the graph tools
-  const server = buildMcpServer(token, savedPrivateKeyPem(), { memoryEngine: engine });
+  const server = buildMcpServer(token, savedPrivateKeyPem(), { memoryEngine: engine, guidance: null });
   const client = new Client({ name: 'decoy-import', version: '1' });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(a), client.connect(b)]);
@@ -6070,6 +6222,7 @@ async function runContext(): Promise<void> {
     try { seen?.saveUnanswered(new Date()); } catch { /* not recorded */ }
   }, left);
   let text = CONTEXT_UNAVAILABLE;
+  let shownOnPrint: (() => void) | null = null;
   try {
     const token = envOrSavedToken();
     if (!token) text = contextNotPaired(PACKAGE_VERSION);
@@ -6078,11 +6231,11 @@ async function runContext(): Promise<void> {
       try { seen = contextSeenStore(connection()); } catch { /* nothing is kept */ }
       const namesBy = Date.now() + left - CONTEXT_NAMES_RESERVE_MS;
       let read: { memories: boolean; summary: boolean } | null = null;
-      try { text = await memoryContextText(server, { full: process.argv.includes('--full'), seen, namesBy, onRead: (r) => { read = r; } }); } finally { await server.close(); }
+      try { text = await memoryContextText(server, { full: process.argv.includes('--full'), seen, namesBy, onRead: (r) => { read = r; }, printed: (f) => { shownOnPrint = f; } }); } finally { await server.close(); }
       if (read && !said) await startSessionFromContext(read);
     }
   } catch { /* said in one line below */ }
-  if (!said) say(text);
+  if (!said) { say(text); (shownOnPrint as (() => void) | null)?.(); }
 }
 
 /** The session record a one-shot command keeps (src/session-state.ts); null when there is no
@@ -6151,7 +6304,7 @@ async function recallFor(prompt: string, timeoutMs: number): Promise<unknown[]> 
 }
 
 /** The brief a session starts with: what --context prints. */
-async function briefForHook(budgetLeftMs: number): Promise<string | null> {
+async function briefForHook(budgetLeftMs: number, printed?: (shown: () => void) => void): Promise<string | null> {
   const token = envOrSavedToken();
   if (!token) return contextNotPaired(PACKAGE_VERSION);
   const server = buildMcpServer(token, savedPrivateKeyPem());
@@ -6159,7 +6312,7 @@ async function briefForHook(budgetLeftMs: number): Promise<string | null> {
   try { seen = contextSeenStore(connection()); } catch { /* nothing is kept */ }
   let read: { memories: boolean; summary: boolean } | null = null;
   try {
-    const text = await memoryContextText(server, { seen, namesBy: Date.now() + budgetLeftMs - CONTEXT_NAMES_RESERVE_MS, onRead: (r) => { read = r; } });
+    const text = await memoryContextText(server, { seen, namesBy: Date.now() + budgetLeftMs - CONTEXT_NAMES_RESERVE_MS, onRead: (r) => { read = r; }, printed: printed ?? (() => {}) });
     if (read) await startSessionFromContext(read);
     // Fill the kept vectors while the person types their first prompt.
     if ((read as { memories: boolean } | null)?.memories) spawnWarm();
@@ -6244,9 +6397,11 @@ async function runHook(argv: string[]): Promise<void> {
     let state: HookState = store?.load() ?? { prompts: 0, cuePending: false, lastCheckAt: 0, promptsSinceCheck: 0, shown: [], counts: { recalls: 0, checks: 0 } };
     const keep = () => { try { store?.save(state); } catch { /* the record is a convenience */ } };
     let action: HookAction = { kind: 'none' };
+    // What records Decoy's guidance change as shown, once the brief that names it is printed.
+    let shownOnPrint: (() => void) | null = null;
 
     if (event === 'session-start') {
-      const text = await briefForHook(left());
+      const text = await briefForHook(left(), (f) => { shownOnPrint = f; });
       if (text) action = { kind: 'context', text };
       // One session start (the denominator of "sessions that read memory"), and what this session's
       // hooks did before it was resumed or cleared.
@@ -6279,7 +6434,9 @@ async function runHook(argv: string[]): Promise<void> {
       // The answer first; the counts go after it, within what is left of the hook's time.
       return say(hookOutput(host, event, action), send);
     }
+    const printing = !said;
     say(hookOutput(host, event, action));
+    if (printing && action.kind === 'context') (shownOnPrint as (() => void) | null)?.();
   } catch { say(none); }
 }
 
@@ -6576,7 +6733,8 @@ async function runStdio(): Promise<void> {
   let hostSaid = false;
   let inUse: { token: string; keyPair: AgentKeyPair; c: Connection } | null = null;
   const sendHostSite = () => { if (hostSaid && inUse) void syncDetected({ ...inUse, client: hostClientInfo() }); };
-  const serverOn = (token: string, keyPair: AgentKeyPair, c: Connection): Promise<Client> => {
+  const serverOn = async (token: string, keyPair: AgentKeyPair, c: Connection): Promise<Client> => {
+    if (pairingApproved && approvedToken === token) await verifyApprovedConnection(token);
     globalToken = token;
     globalKeyPair = keyPair;
     void syncIdentity({ identity: agentIdentity(process.env), token, agentApiUrl: AGENT_API_URL, fetchImpl: decoyFetch,
@@ -6658,7 +6816,7 @@ async function runStdio(): Promise<void> {
     // A connection saved after this process opened its own (another run of the bridge with this
     // home paired, or reconnected after a refusal): opened again from the files and used.
     const again = reopenConnection();
-    const token = again.source === 'files' ? again.credentials()?.access_token : undefined;
+    const token = again.source === 'files' || again.source === 'credentials-file' ? again.credentials()?.access_token : undefined;
     if (!token || !again.keyPair || token === lostToken) return null;
     c = again;
     lostToken = null;
