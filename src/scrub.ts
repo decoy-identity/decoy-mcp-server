@@ -17,10 +17,11 @@ const MIN_PIECE = 16;
 export const REMOVED = '[token removed]';
 
 /** The forms of one secret to look for. */
-function forms(secret: string): string[] {
+export function secretForms(secret: string, minLength = MIN_PIECE, hex = false): string[] {
   const b64 = Buffer.from(secret, 'utf8').toString('base64');
   const out = new Set([secret, encodeURIComponent(secret), b64, b64.replace(/=+$/, ''), b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')]);
-  return [...out].filter((f) => f.length >= MIN_PIECE);
+  if (hex) { const h = Buffer.from(secret, 'utf8').toString('hex'); out.add(h); out.add(h.toUpperCase()); }
+  return [...out].filter((f) => f.length >= minLength);
 }
 
 /** How much of a JWT's payload segment is shared between tokens: it opens with the same claim
@@ -35,19 +36,21 @@ function pieceSource(form: string, isRawJwt: boolean): { text: string; shared: n
   return { text: form.slice(form.indexOf('.') + 1), shared: SHARED_PAYLOAD_PREFIX };
 }
 
-export function makeScrubber(secrets: () => Array<string | undefined | null>): (text: string) => string {
+export function makeScrubber(secrets: () => Array<string | undefined | null>, options: { minLength?: number; hex?: boolean; replacement?: string; jwtPieces?: boolean } = {}): (text: string, onMatch?: (start: number, end: number) => void) => string {
+  const minLength = options.minLength ?? MIN_PIECE, replacement = options.replacement ?? REMOVED;
   let cacheKey = '';
   let cached: { whole: string[]; sources: string[]; grams: Map<string, Array<[number, number]>> } | null = null;
   const prepare = () => {
-    const list = [...new Set(secrets().filter((s): s is string => typeof s === 'string' && s.length >= MIN_PIECE))];
+    const list = [...new Set(secrets().filter((s): s is string => typeof s === 'string' && s.length >= minLength))];
     const key = list.join('\u0000');
     if (cached && key === cacheKey) return cached;
     const whole: string[] = [], sources: string[] = [];
     const grams = new Map<string, Array<[number, number]>>();
     for (const secret of list) {
-      const isJwt = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(secret);
-      for (const form of forms(secret)) {
+      const isJwt = options.jwtPieces !== false && /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/.test(secret);
+      for (const form of secretForms(secret, minLength, options.hex)) {
         whole.push(form);
+        if (secret.length < MIN_PIECE) continue;
         const { text: src, shared } = pieceSource(form, isJwt && form === secret);
         if (src.length < MIN_PIECE) continue;
         const si = sources.push(src) - 1;
@@ -64,30 +67,28 @@ export function makeScrubber(secrets: () => Array<string | undefined | null>): (
     return (cached = { whole, sources, grams });
   };
 
-  return (text: string): string => {
-    if (typeof text !== 'string' || text.length < MIN_PIECE) return text;
+  return (text: string, onMatch?: (start: number, end: number) => void): string => {
+    if (typeof text !== 'string' || text.length < minLength) return text;
     const p = prepare();
     if (p.whole.length === 0) return text;
-    // Whole forms first (so a JWT's header goes with it when the whole token is there).
-    let out = text;
-    for (const w of p.whole) if (out.includes(w)) out = out.split(w).join(REMOVED);
-    // Then any piece of 16+ characters: extend each hit as far as it keeps matching.
+    // Original offsets also let a streaming caller keep a match across its output boundary.
     let result = '';
     let i = 0, copiedTo = 0;
-    while (i + MIN_PIECE <= out.length) {
-      const hits = p.grams.get(out.slice(i, i + MIN_PIECE));
-      if (!hits) { i++; continue; }
-      let best = 0;
+    while (i + minLength <= text.length) {
+      let best = p.whole.find((w) => text.startsWith(w, i))?.length ?? 0;
+      const hits = p.grams.get(text.slice(i, i + MIN_PIECE)) ?? [];
       for (const [si, at] of hits) {
         const src = p.sources[si]!;
         let k = MIN_PIECE;
-        while (i + k < out.length && at + k < src.length && out[i + k] === src[at + k]) k++;
+        while (i + k < text.length && at + k < src.length && text[i + k] === src[at + k]) k++;
         if (k > best) best = k;
       }
-      result += out.slice(copiedTo, i) + REMOVED;
+      if (!best) { i++; continue; }
+      onMatch?.(i, i + best);
+      result += text.slice(copiedTo, i) + replacement;
       i += best; copiedTo = i;
     }
-    return copiedTo === 0 ? out : result + out.slice(copiedTo);
+    return copiedTo === 0 ? text : result + text.slice(copiedTo);
   };
 }
 

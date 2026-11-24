@@ -22,12 +22,21 @@ export function incompletePackage(error: unknown, directory: string, version: st
 }
 
 export async function launch(): Promise<void> {
+  const args = process.argv.slice(2);
+  const separator = args.indexOf('--');
+  const own = separator < 0 ? args : args.slice(0, separator);
+  const command = own.findIndex(arg => !arg.startsWith('-'));
+  const stopHook = command >= 0 && own[command] === 'hook' && own[command + 1] === 'stop'
+    && !own.includes('--context') && !own.includes('--import');
+  // Also bound module loading and make incomplete-package failures silent for a Stop hook.
+  if (stopHook) setTimeout(() => process.exit(0), Math.max(0, 3_000 - performance.now()));
   const entry = new URL('./index.js', import.meta.url);
   // index remains independently executable and importable. Use its real path so its existing
   // entrypoint guard starts the requested mode when this executable loads it.
   process.argv[1] = fileURLToPath(entry);
   try { await import(entry.href); }
   catch (error) {
+    if (stopHook) process.exit(0);
     const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version as string;
     const recovery = incompletePackage(error, path.dirname(fileURLToPath(import.meta.url)), version);
     if (!recovery) throw error;

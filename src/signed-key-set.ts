@@ -284,6 +284,8 @@ export function readCanonicalJson(bytes: Uint8Array, maxBytes: number): Canonica
 /** The label of each format that is signed. A format adds its row when it is specified. */
 export const SIGNATURE_LABELS: Readonly<Record<string, string>> = Object.freeze(Object.assign(Object.create(null), {
   'key-set': 'decoy/signature/key-set',
+  'agent-directory': 'decoy/signature/agent-directory',
+  'agent-session-directory': 'decoy/signature/agent-session-directory',
 }));
 /** A P1363 P-256 signature: r and s, 32 bytes each. */
 export const SIGNATURE_BYTES = 64;

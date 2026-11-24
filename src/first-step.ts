@@ -10,7 +10,7 @@
 // token (the bridge does that), so a token Decoy refuses is the "could not be read" line.
 
 import type { ContextSeen } from './context-seen.js';
-import { PLAIN_VERSION, UPDATE_COMMAND } from './api-error.js';
+import { PLAIN_VERSION } from './api-error.js';
 
 /** The time budget of a whole `--context` run, counted from the start of its process: the run has
  *  printed by then, whatever Decoy did. A hook waits for the run as a whole, so the whole is what
@@ -25,10 +25,11 @@ export const CONTEXT_REQUEST_TIMEOUT_MS = 5_000;
  *  before it are left out, and the summary is printed without them. */
 export const CONTEXT_NAMES_RESERVE_MS = 500;
 
-export const CONTEXT_LEAD = 'Decoy holds what is known about this person. Reading this is the first step of every task, including tasks with no login.';
+export const CONTEXT_LEAD = 'Decoy holds what is known about this person. Read before every task, including tasks with no login.';
+export const ALREADY_CONNECTED_RULE = "You're already connected to Decoy here. Use these tools for anything about this person's Decoy. Never start a new connection or pairing to get access. If the connection is revoked, tell the person to reconnect it from the Decoy app. If access is missing, ask for it on this connection.";
 export const CONTEXT_HABITS = [
-  'Before you start, and before asking the person: read what is saved (search_memories for the subject of the task, and list_topics).',
-  'As you work: save lasting facts as they come up (add_memory), each linked to the account or topic it belongs to.',
+  'Before tasks or questions: read what is saved (search_memories, list_topics).',
+  'Save lasting facts as they come up (add_memory), linked to the account or topic it belongs to.',
 ] as const;
 /** Said only by a connection that reads all memories: for any other, nothing it can read is all that is known. */
 export const CONTEXT_NOTHING_SAVED = 'Nothing is saved about this person so far.';
@@ -64,7 +65,12 @@ export function launchCommand(o: { self: string; argv1?: string; entry: boolean;
 export const firstStepCommand = (version: string, local?: string | null) => (local ? `${local} --context` : `npx -y decoy-mcp-server@${version} --context`);
 /** Said once per session while no `--context` run is recorded on this machine. */
 export const firstStepLine = (version: string, local?: string | null) =>
-  `Decoy first step: no run of it is recorded on this machine. At the start of every task, run \`${firstStepCommand(version, local)}\` and read its output; put that command in a session-start hook or in your standing notes.`;
+  `Decoy first step: no run of it is recorded on this machine. At the start of every task, run \`${firstStepCommand(version, local)}\` and read its output; put that command in a session-start hook or in your standing notes.\n${stopHookStepLine(version, local)}`;
+
+/** Existing --context-only installs receive this too: the agent adds its own host's hook. */
+export const stopHookCommand = (version: string, local?: string | null) => (local ? `${local} hook stop --host <host>` : `npx -y decoy-mcp-server@${version} hook stop --host <host>`);
+export const stopHookStepLine = (version: string, local?: string | null) =>
+  `Decoy Stop hook: no run is recorded on this machine. Add \`${stopHookCommand(version, local)}\` to your own Stop settings alongside session-start, replacing <host> with claude-code, codex, gemini-cli, antigravity or cursor. It checks for lasting facts in the exchange and also asks after 20 hours without a save, at most once per 20 hours per connection; failures let the session end.`;
 
 /** A version's three numbers, and whether it is a prerelease (`-rc.1`); build metadata (`+x`) counts for nothing. */
 const core = (v: string): { n: number[]; pre: boolean } | null => {
@@ -75,7 +81,20 @@ const core = (v: string): { n: number[]; pre: boolean } | null => {
  *  The line is the bridge's own: only a well-formed released version newer than this one is taken
  *  from the answer, never its text or command. The line grants nothing: it says to update when the
  *  person's own setup text asks for the bridge to be kept current, and otherwise to tell the person. */
-export function bridgeUpdateLine(answer: unknown, running: string): string | null {
+export type BridgeInstallKind = 'npx' | 'npx-latest' | 'pinned' | 'global' | 'local' | 'desktop-extension' | 'launch-agent';
+/** Installation facts only: never inspect credentials, shell profiles or other applications. */
+export function bridgeInstallKind(o: { self: string; env: Record<string, string | undefined> }): BridgeInstallKind {
+  if (o.env.DECOY_DESKTOP_EXTENSION === 'true') return 'desktop-extension';
+  const kinds: BridgeInstallKind[] = ['npx', 'npx-latest', 'pinned', 'global', 'local', 'launch-agent'];
+  if (kinds.includes(o.env.DECOY_BRIDGE_INSTALL as BridgeInstallKind)) return o.env.DECOY_BRIDGE_INSTALL as BridgeInstallKind;
+  if (/decoy/i.test(o.env.XPC_SERVICE_NAME ?? '')) return 'launch-agent';
+  const file = o.self.replace(/\\/g, '/');
+  if (o.env.npm_command === 'exec' || file.split('/').includes('_npx')) return 'npx';
+  if (/\/lib\/node_modules\/decoy-mcp-server\//.test(file) || /\/npm\/node_modules\/decoy-mcp-server\//i.test(file)) return 'global';
+  return 'local';
+}
+
+export function bridgeUpdateLine(answer: unknown, running: string, install: BridgeInstallKind = 'npx'): string | null {
   const u = answer && typeof answer === 'object' ? (answer as { bridge_update?: unknown }).bridge_update : null;
   const latest = u && typeof u === 'object' ? (u as { latest_version?: unknown }).latest_version : null;
   if (typeof latest !== 'string' || !PLAIN_VERSION.test(latest)) return null;
@@ -88,10 +107,18 @@ export function bridgeUpdateLine(answer: unknown, running: string): string | nul
   const shown = /^[\w.+-]{1,40}$/.test(running) ? running : mine.n.join('.');
   // The version is Decoy's word, so a pin moves only once npm itself answers with that release.
   // The start command is not an update: it runs a bridge, so the update is a restart.
-  return `decoy-mcp-server ${latest} is available (this bridge is ${shown}). If the person's setup text asks you to keep the bridge on its latest release, update it: ` +
-    `a bridge started with \`${UPDATE_COMMAND}\` takes the new release when it restarts: restart it, and never run that command beside the running bridge (it starts a second one). ` +
-    `An install with its own update: use that. A start command pinned to a version: change it to ${latest} only once \`npx -y decoy-mcp-server@${latest} --version\` answers ${latest}, then restart. ` +
-    `The saved connection is kept. Otherwise, tell the person that ${latest} is out and give them that command.`;
+  const pinned = `Check that \`npx -y decoy-mcp-server@${latest} --version\` answers ${latest}, change the pinned start command to that version, then restart Decoy.`;
+  const actions: Record<BridgeInstallKind, string> = {
+    'npx-latest': 'Restart the Decoy start command that uses @latest.',
+    pinned,
+    npx: `Restart the Decoy start command if it uses @latest. If it pins a version: ${pinned} Never start a second bridge beside the running one.`,
+    global: 'Run `npm install -g decoy-mcp-server@latest`, then restart Decoy.',
+    local: 'Run `npm install decoy-mcp-server@latest` in the folder where Decoy is installed, then restart Decoy.',
+    'desktop-extension': 'Install the newer Decoy extension file in Claude Desktop, then restart Claude Desktop.',
+    'launch-agent': 'Update the Decoy installation or pinned start command used by its LaunchAgent, then reload that LaunchAgent to restart Decoy.',
+  };
+  return `A newer Decoy is out (${latest}; this is ${shown}). ${actions[install]} ` +
+    "The saved connection is kept. If the person's setup text asks you to keep the bridge on its latest release, do this. Otherwise, tell the person how to update in plain words.";
 }
 /** The --context output with the update line after its first line. */
 export const withUpdateLine = (text: string, line: string | null): string => {
@@ -125,12 +152,12 @@ export function contextText(o: { brief: string; since: string | null; rules?: st
   // that they are waiting, never that nothing is saved. `after`: lines that follow the summary
   // (or that line) when it has none of its own.
   const nothing = o.waiting ? [] : [o.all ? CONTEXT_NOTHING_SAVED : CONTEXT_NOTHING_READABLE];
-  const short = [CONTEXT_LEAD, ...(o.brief.trim() ? [o.brief.trim()] : nothing), ...(o.after?.trim() ? [o.after.trim()] : []), ...(o.waiting ? [o.waiting] : []), ...CONTEXT_HABITS, ...(o.since ? [o.since] : [])].join('\n');
+  const short = [CONTEXT_LEAD, ALREADY_CONNECTED_RULE, ...(o.brief.trim() ? [o.brief.trim()] : nothing), ...(o.after?.trim() ? [o.after.trim()] : []), ...(o.waiting ? [o.waiting] : []), ...CONTEXT_HABITS, ...(o.since ? [o.since] : [])].join('\n');
   return o.rules ? `${short}\n\n${o.rules}` : short;
 }
 
 /** The output of a run on a connection that cannot read memories: the fact, and the call the
  *  agent may make, only on the run that could record having said it. */
 export function noMemoryAccessText(ask: boolean): string {
-  return ask ? `${CONTEXT_NO_MEMORY_ACCESS} ${CONTEXT_MAY_ASK}` : CONTEXT_NO_MEMORY_ACCESS;
+  return `${ask ? `${CONTEXT_NO_MEMORY_ACCESS} ${CONTEXT_MAY_ASK}` : CONTEXT_NO_MEMORY_ACCESS}\n${ALREADY_CONNECTED_RULE}`;
 }

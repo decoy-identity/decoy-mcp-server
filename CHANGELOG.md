@@ -1,7 +1,21 @@
 # Changelog
 
+## 1.9.0
+
+- `decoy run` gives a command saved secrets through named environment variables, masks its output and can obtain short-lived AWS credentials.
+- First connect asks for permission to read, save, edit and delete memories, create accounts, read account mail and read aliases. You choose the access; existing connections keep their grants.
+- Pages follow the personal-wiki writing rules. A page's optional `hook` is a sealed, neutral cue of up to 160 characters for Did you know; agents can save, change, read or remove it.
+- Save-due reminders use a connection's active days and last save across sessions. `my_permissions` reports the last save; supported coding hosts can check again when an agent stops, including after 20 hours without a save.
+- Confirmed account and address creations save dated facts linked to the account, in the background. They carry activity provenance and deduplicate retries; intentional saves and corrections satisfy save reminders. Each fact contains a validated site host and never copies the account's display or service name. The text holds no password, code, user name or alias address and shows that you have an account with that site. Missing or unsafe sites produce generic wording. Save access is required and existing memory grants determine who reads each fact.
+- Opening briefs announce newer bridge releases and give update and restart steps. Guidance notices ask agents to refresh memories and pages. Startup instructions use the saved connection, and `--reconnect` protects a working connection from accidental pairing.
+
 ## 1.8.2
 
+- **The first save quotes your request from Decoy's setup prompts.** New-pairing replies and
+  operating rules use `firstSave` verbatim from the bundled `vendor/agent-setup.json`. Recurring
+  reminders read their shared memory-rule wording from the same snapshot. Setup wording is read
+  locally; maintainers refresh the website response with `npm run sync:agent-setup` in a source
+  checkout. The snapshot is included in both the npm package and the desktop extension.
 - **Each topic has one page.** A page is a memory filed on its topic whose title is exactly the
   topic's name; the person's own page is a memory with no topic and no account, titled `You`.
   Facts stay in their own memories, one fact each by default. The page explains them like a

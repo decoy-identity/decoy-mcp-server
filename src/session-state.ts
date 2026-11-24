@@ -64,6 +64,8 @@ export interface SessionState {
   read_reminder_sent: boolean;
   save_reminder_sent: boolean;
   first_step_said: boolean;
+  /** This session has received the bridge's update line. Absent in older records. */
+  bridge_update_said?: boolean;
   /** When a `--context` run of this session last read Decoy. */
   context_at: string | null;
   /** The fingerprint of the access this session last saw (src/access-summary.ts accessFingerprint). */
@@ -82,7 +84,7 @@ export function freshSession(now: Date): SessionState {
 }
 
 export function serializeSessionState(s: SessionState): string {
-  return JSON.stringify(Object.fromEntries(KEYS.map((k) => [k, s[k]]))) + '\n';
+  return JSON.stringify({ ...Object.fromEntries(KEYS.map((k) => [k, s[k]])), ...(s.bridge_update_said === true ? { bridge_update_said: true } : {}) }) + '\n';
 }
 
 /** The file's contents as a session record, or null when they are anything else. Every field is
@@ -91,7 +93,8 @@ export function parseSessionState(text: string): SessionState | null {
   if (text.length > SESSION_MAX_BYTES) return null;
   let p: Record<string, unknown>;
   try { const j: unknown = JSON.parse(text); if (!j || typeof j !== 'object' || Array.isArray(j)) return null; p = j as Record<string, unknown>; } catch { return null; }
-  const names = Object.keys(p);
+  if (p.bridge_update_said !== undefined && typeof p.bridge_update_said !== 'boolean') return null;
+  const names = Object.keys(p).filter(k => k !== 'bridge_update_said');
   if (names.length !== KEYS.length || !KEYS.every((k) => Object.hasOwn(p, k))) return null;
   const count = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 1_000_000_000;
   const time = (v: unknown) => typeof v === 'string' && TIME.test(v) && Number.isFinite(Date.parse(v));
@@ -103,7 +106,7 @@ export function parseSessionState(text: string): SessionState | null {
   if (p.last_save_at !== null && !time(p.last_save_at)) return null;
   if (p.context_at !== null && !time(p.context_at)) return null;
   if (p.access !== null && !(typeof p.access === 'string' && FINGERPRINT.test(p.access))) return null;
-  return Object.fromEntries(KEYS.map((k) => [k, p[k]])) as unknown as SessionState;
+  return { ...Object.fromEntries(KEYS.map((k) => [k, p[k]])), ...(p.bridge_update_said === true ? { bridge_update_said: true } : {}) } as unknown as SessionState;
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');

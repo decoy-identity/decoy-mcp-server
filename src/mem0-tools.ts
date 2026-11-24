@@ -30,7 +30,7 @@ import { readWithRetry, waitingText, WaitingError } from './waiting.js';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { DEFAULT_TOPIC_RELATION, GraphRefusal, NAME_CHARS, SUGGESTED_RELATIONS_MAX, TOPIC_TYPES, USER_ENTITY, accountSuffix, cleanMemoryTitle, cleanEditNote, nameKey, oneLine, movingText, retryWait, shownTopic, type ContextGraph, type MemoryChange, type ListedTopic, type Entity, type MemoryRecord, type Relation, type TopicRef, type TopicResult, type TopicSpec } from './context-graph.js';
+import { DEFAULT_TOPIC_RELATION, GraphRefusal, NAME_CHARS, SUGGESTED_RELATIONS_MAX, TOPIC_TYPES, USER_ENTITY, accountSuffix, cleanMemoryTitle, cleanEditNote, cleanPageHook, validatePageHook, nameKey, oneLine, movingText, retryWait, shownTopic, type ContextGraph, type MemoryChange, type ListedTopic, type Entity, type MemoryRecord, type Relation, type TopicRef, type TopicResult, type TopicSpec } from './context-graph.js';
 import { CLOSE_WORD_OVERLAP, MEM0_CATEGORIES, type ChatMessage, type MemoryEngineLike } from './memory-engine.js';
 import { CATEGORY_GUIDE } from './memory-categories.js';
 import { gatedRegister } from './register-tools.js';
@@ -359,6 +359,7 @@ function excerpt(text: string, max = SEARCH_TEXT_CHARS): string {
 
 export interface Mem0Item {
   id: string;
+  hook?: string;
   memory: string;
   hash: string;
   metadata: Record<string, unknown> | null;
@@ -388,6 +389,9 @@ export function topicLinkOf(l: string | { to?: string; relation?: string } | und
 
 const TITLE_UNREADABLE = 'title has no readable characters. Send a title in words, or "" to remove it.';
 const NOTE_UNREADABLE = 'note has no readable characters. Send one line in words saying what this edit changed, or leave it out.';
+const HOOK_PAGE_ONLY = 'hook is only allowed on a page: a memory with no account titled its topic\'s name, or "You" on no topic. Use update_memory to change an existing page\'s hook.';
+const PAGE_WRITING_HELP = 'For pages: bold the subject in the first sentence, saying what it is; the lead summarizes the whole page; name topics after their subject, with errands as dated sections; every person a memory says something about gets their own page; opinions are attributed; See also skips pages already linked in the body; disagreements are stated where the fact is. Full page guidance: https://www.decoys.me/agent-memories.md.';
+const PAGE_HOOK_HELP = 'Only on a page: its homepage Did you know hook, one "… that …" line with one definite fact from the page, at most 160 characters, with the page\'s name in bold; choose something unusual to someone who does not know the person, neutral, no superlatives, and a fact that won\'t change soon. Rewrite it when the page gains a better fact. Sealed beside the title; omitting it keeps the existing hook, and an empty string removes it.';
 /** Said when a text changes beside a title that stays: the title may now say something else. */
 const titleKept = (title: string) => `The title ${JSON.stringify(title)} was kept. If it no longer fits the new text, send a new title with update_memory.`;
 const MEMORY_TITLE_HELP = 'A short title, on one line: what the memory is about, in a few words. Give every memory one; it is what the owner sees in their list. It is separate from the text: do not repeat it as a first heading. A topic\'s page is titled exactly the topic\'s name; the person\'s own page, "You".';
@@ -396,15 +400,19 @@ export const PAGE_NOT_TAGGED = 'A page carries no categories, so the categories 
 /** Said when an edit left a memory a page and removed the categories it had. */
 export const PAGE_UNTAGGED = 'A page carries no categories, so the ones it had were removed.';
 /**
- * update_memory's and move_memories' page rule (src/memory-pages.ts), for the graph's edit: an edit
+ * The page rule for updates, moves and duplicate attachment (src/memory-pages.ts): an edit
  * that leaves a memory a page sets no categories and removes any it had, and only a connection whose
  * read grant covers the whole topic (for "You": every memory) makes a memory a page. `untagged`
  * says afterwards whether categories were sent ('sent') or removed ('had').
  */
-function pageRule(id: string, change: { text?: string; title?: string; categories?: string[]; topic?: string | null }) {
+function pageRule(id: string, change: { text?: string; title?: string; hook?: string; categories?: string[]; topic?: string | null }) {
   let untagged: 'sent' | 'had' | null = null;
   const rule: NonNullable<MemoryChange['rule']> = async ({ before, title, topicName, readsWhole }) => {
-    if (!isPage(title, { topicName, accountId: before.accountId })) return null;
+    if (!isPage(title, { topicName, accountId: before.accountId })) {
+      const hook = change.hook === undefined ? before.hook : cleanPageHook(change.hook);
+      if (hook) return { refuse: change.hook !== undefined ? HOOK_PAGE_ONLY : 'This change would leave a hook on a memory that is no longer a page. First remove the hook with update_memory({ memory_id, hook: "" }), then change its title or topic.' };
+      return null;
+    }
     // A page that stays the page of the same topic (or "You") needs no new check; one that becomes a
     // page, or a page moved to another topic, does.
     const samePage = isPageRecord(before) && (before.topic && topicName !== null ? nameKey(before.topic.name) === nameKey(topicName) : !before.topic && topicName === null);
@@ -417,7 +425,7 @@ function pageRule(id: string, change: { text?: string; title?: string; categorie
     }
     const had = knownCategories(before.categories).length > 0;
     if (!had && !change.categories?.length) return null;
-    if (!had && change.text === undefined && change.title === undefined && change.topic === undefined) {
+    if (!had && change.text === undefined && change.title === undefined && change.hook === undefined && change.topic === undefined) {
       return { refuse: `Memory ${id} is a page. ${PAGE_NOT_TAGGED} Nothing was changed.` };
     }
     untagged = had ? 'had' : 'sent';
@@ -438,7 +446,9 @@ function namedTopic(ref: string, topics: TopicRef[], records: readonly MemoryRec
 }
 
 export interface AddInput {
-  text: string; title?: string; messages?: ChatMessage[]; app_id?: string; metadata?: Record<string, unknown>; categories?: string[];
+  /** Bridge-internal provenance; never exposed as an add_memory tool argument. */
+  origin?: 'activity';
+  text: string; title?: string; hook?: string; messages?: ChatMessage[]; app_id?: string; metadata?: Record<string, unknown>; categories?: string[];
   topic?: string; topic_type?: string; topic_link?: string | { to?: string; relation?: string };
   /** The id of the memory this one replaces: that memory is corrected in place. */
   supersedes?: string;
@@ -493,7 +503,7 @@ export function closeTier(text: string, existing: string, similarity: number, sa
 }
 /** Said in a result when a topic was created from the user with the relation the bridge fills in. */
 export const RELATION_DEFAULTED = `This topic was created with the relation "${DEFAULT_TOPIC_RELATION}" because the call named none. When you create a topic, pass topic_link.relation: what is true and specific for this person and subject.`;
-export interface UpdateInput { text?: string; title?: string; note?: string; categories?: string[]; topic?: string | null; topic_type?: string; topic_link?: string | { to?: string; relation?: string }; expected_rev?: number }
+export interface UpdateInput { text?: string; title?: string; note?: string; hook?: string; categories?: string[]; topic?: string | null; topic_type?: string; topic_link?: string | { to?: string; relation?: string }; expected_rev?: number }
 
 type Filters = Record<string, unknown>;
 
@@ -532,7 +542,7 @@ export class Mem0Memories {
     const app = oneLine(r.accountId ? byAccount.get(r.accountId) ?? r.entityName : r.aboutHint, NAME_CHARS);
     const agent = r.mine ? THIS_AGENT : fromOtherAgent(r) ? OTHER_AGENT : undefined;
     return {
-      id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), hash: md5(r.text), metadata: r.metadata ?? null, categories: r.categories ? knownCategories(r.categories) : null,
+      id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), ...(r.hook ? { hook: r.hook } : {}), hash: md5(r.text), metadata: r.metadata ?? null, categories: r.categories ? knownCategories(r.categories) : null,
       created_at: r.createdAt, updated_at: r.updatedAt, user_id: USER_ENTITY,
       ...(agent ? { agent_id: agent } : {}),
       ...(app ? { app_id: app } : {}),
@@ -635,6 +645,7 @@ export class Mem0Memories {
   }
 
   private async addUnchecked(input: AddInput, canSample: boolean, pages: { listing?: boolean } | null) {
+    validatePageHook(input.hook);
     const unknown = (input.categories ?? []).filter(c => !(MEM0_CATEGORIES as readonly string[]).includes(c));
     if (unknown.length) throw new Error(`Unknown categories: ${unknown.join(', ')}. Use one or more of: ${MEM0_CATEGORIES.join(', ')}.`);
     if (input.title !== undefined && input.title.trim() && !cleanMemoryTitle(input.title)) throw new Error(TITLE_UNREADABLE);
@@ -654,11 +665,18 @@ export class Mem0Memories {
     const facts = fromMessages ? await this.engine.extractFacts(input.messages!) : [input.text];
     const where = { topic: input.topic, accountId, topics };
     if (input.supersedes !== undefined) return this.supersede(input, facts, items, where);
-    const byHash = new Map(items.map(e => [e.item.hash, e]));
+    // Automatic facts describe a confirmed event, not a new interpretation of text. Two
+    // accounts (or two replacement addresses) can have exactly the same sentence. Their
+    // event keys live inside sealed metadata; an idempotent replay keeps the same key.
+    const activity = input.origin === 'activity' && !!accountId;
+    const event = activity && typeof input.metadata?.activity_event === 'string' ? input.metadata.activity_event : null;
+    const duplicateItems = activity ? items.filter(e => e.record.accountId === accountId
+      && (!event || !e.record.metadata?.activity_event || e.record.metadata.activity_event === event)) : items;
+    const byHash = new Map(duplicateItems.map(e => [e.item.hash, e]));
     const fresh: string[] = [];
     const duplicates: { id: string; memory: string; similarity?: number }[] = [];
     const skipped: { memory: string; reason: string }[] = [];
-    const attach: { id: string; categories?: string[] }[] = [];
+    const attach: { id: string; categories?: string[]; rule: MemoryChange['rule'] }[] = [];
     // A duplicate this agent saved, with no topic yet, asked to go under one: file it there (same id)
     // instead of skipping it or saving a copy. One that already has a topic (or an account) stays.
     // Only this agent's OWN memories: someone else's duplicate is reported, never relabelled.
@@ -674,15 +692,19 @@ export class Mem0Memories {
       if (COURTESY.test(text)) { skipped.push({ memory: text, reason: 'no lasting fact (a courtesy, not something to remember)' }); continue; }
       // Only the same text is a duplicate. One that is nearly the same may carry the one thing
       // that changed (a number, a date, a name): it is held below, never skipped here.
-      const hit = byHash.get(md5(text)) ?? items.find(e => sameText(e.record.text, text));
-      if (hit && attachable(hit.record)) { attach.push({ id: hit.record.id, categories: input.categories }); continue; }
+      const hit = (event ? duplicateItems.find(e => e.record.metadata?.activity_event === event) : undefined)
+        ?? byHash.get(md5(text)) ?? duplicateItems.find(e => sameText(e.record.text, text));
+      if (hit && attachable(hit.record)) {
+        attach.push({ id: hit.record.id, categories: input.categories, rule: pageRule(hit.record.id, { topic: input.topic, categories: input.categories }).rule });
+        continue;
+      }
       const moving = hit && movable(hit.record) ? hit.record : undefined;
       if (hit && !moving) { duplicates.push({ id: hit.record.id, memory: hit.record.text }); continue; }
       if (fresh.includes(text) || held.some(h => h.memory === text)) continue;
       if (moving) moves.set(text, moving);
       // Look before writing. A memory that says the same in all but a detail holds this one back;
       // one that is only similar by score lets it through, flagged.
-      const close = input.confirm_new ? [] : await this.closeTo(text, items, where);
+      const close = input.confirm_new || activity ? [] : await this.closeTo(text, items, where);
       if (close.some(c => c.strong)) { held.push({ memory: text, candidates: close.map(shownAs) }); continue; }
       if (close.length) flagged.set(text, close.map(shownAs));
       if (close.some(c => c.fuller)) fuller = true;
@@ -696,11 +718,13 @@ export class Mem0Memories {
     // A topic named by an id this connection has not listed: its name as the graph knows it.
     // (Looked up from the value as given, as the save resolves it; one it does not find is a new topic's name.)
     if ((ownTitle !== undefined || attach.length) && !accountId && input.topic !== undefined && pageTopic !== null && /^topic:/i.test(pageTopic)) pageTopic = (await this.graph.topicNameOf(input.topic)) ?? pageTopic;
-    const page = ownTitle !== undefined && !accountId && fresh.length === 1 && isPage(cleanMemoryTitle(ownTitle), { topicName: pageTopic, accountId: null });
+    // Eligibility describes the requested page even when dedupe holds it or skips a duplicate.
+    const page = ownTitle !== undefined && !accountId && isPage(cleanMemoryTitle(ownTitle), { topicName: pageTopic, accountId: null });
+    if (input.hook !== undefined && !page) throw new Error(HOOK_PAGE_ONLY);
     // Only a connection whose read grant covers the whole topic (for "You": every memory) makes a
     // page; a topic this save would create is covered only by a grant on every memory.
     // The topic as the save resolves it (an exact id, or a name to the oldest), and its same-name topics.
-    const refused = page ? pageRefusal(await this.graph.readsWhole(input.topic !== undefined ? input.topic : null), pageTopic) : null;
+    const refused = page && fresh.length ? pageRefusal(await this.graph.readsWhole(input.topic !== undefined ? input.topic : null), pageTopic) : null;
     if (refused) throw new Error(refused);
     // A memory filed under the topic in place (attach) that the topic's name titles would become its
     // page without that check: it is left where it was, and named as a duplicate.
@@ -731,8 +755,8 @@ export class Mem0Memories {
         const metadata = input.metadata ?? moves.get(text)?.metadata;
         // A memory that moves keeps its title too, unless this call names one.
         const title = ownTitle ?? moves.get(text)?.title;
-        return { text, ...(title ? { title } : {}), ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
-      }), { accountId, aboutHint, topic: fresh.length || attach.length ? topic : undefined, attach });
+        return { text, ...(title ? { title } : {}), ...(input.hook !== undefined ? { hook: input.hook } : {}), ...(metadata ? { metadata } : {}), ...(tags[i]?.length ? { categories: tags[i] } : {}) };
+      }), { accountId, aboutHint, topic: fresh.length || attach.length ? topic : undefined, attach, origin: input.origin });
     } catch (err) {
       // The write failed, so nothing is removed: said in the error itself.
       if (moves.size && err instanceof Error) err.message = `${err.message} Nothing was moved: ${unchanged([...moves.values()].map(r => r.id))}.`;
@@ -767,7 +791,7 @@ export class Mem0Memories {
     }
     // Where each memory landed, said first among what places it: an account, a topic, or the user.
     const byAccount = new Map(accounts.map(a => [a.accountId, a.name]));
-    const result = (r: MemoryRecord, event: 'ADD' | 'UPDATE') => ({ id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), event, filed: filedOf(r, byAccount, saved.topic?.parent), ...(r.accountId ? { app_id: oneLine(byAccount.get(r.accountId) ?? r.entityName, NAME_CHARS) } : {}), categories: knownCategories(r.categories), rev: r.rev, topic: r.topic && shownTopic(r.topic), ...(movedFrom.has(r.id) ? { moved_from: movedFrom.get(r.id), ...(gonebefore.has(r.id) ? { older_already_removed: true } : {}) } : {}) });
+    const result = (r: MemoryRecord, event: 'ADD' | 'UPDATE') => ({ id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), ...(r.hook ? { hook: r.hook } : {}), event, filed: filedOf(r, byAccount, saved.topic?.parent), ...(r.accountId ? { app_id: oneLine(byAccount.get(r.accountId) ?? r.entityName, NAME_CHARS) } : {}), categories: knownCategories(r.categories), rev: r.rev, topic: r.topic && shownTopic(r.topic), ...(movedFrom.has(r.id) ? { moved_from: movedFrom.get(r.id), ...(gonebefore.has(r.id) ? { older_already_removed: true } : {}) } : {}) });
     const results = [...saved.written.map(r => result(r, 'ADD')), ...saved.attached.map(r => result(r, 'UPDATE'))];
     const rest = {
       ...(saved.topic ? { topic: { id: saved.topic.id, name: oneLine(saved.topic.name, NAME_CHARS), created: saved.topic.created, ...(saved.topic.relationDefaulted ? { relation_defaulted: true } : {}) } } : {}),
@@ -867,10 +891,11 @@ export class Mem0Memories {
       const r = await this.update(id, {
         text: texts[0], expected_rev: candidate.rev,
         ...(input.title?.trim() ? { title: input.title } : {}),
+        ...(input.hook !== undefined ? { hook: input.hook } : {}),
         ...(input.categories?.length ? { categories: [...new Set([...(old.record.categories ?? []), ...input.categories])] } : {}),
       });
       this.shownRev.delete(id);
-      const results = [{ id: r.id, memory: r.memory, ...(r.title ? { title: r.title } : {}), event: 'UPDATE' as const, filed: r.filed, categories: r.categories, rev: r.rev, topic: r.topic, ...(r.app_id ? { app_id: r.app_id } : {}), superseded: true }];
+      const results = [{ id: r.id, memory: r.memory, ...(r.title ? { title: r.title } : {}), ...(r.hook ? { hook: r.hook } : {}), event: 'UPDATE' as const, filed: r.filed, categories: r.categories, rev: r.rev, topic: r.topic, ...(r.app_id ? { app_id: r.app_id } : {}), superseded: true }];
       // The corrected memory now says what this text says. A copy of the text that this connection
       // saved (when the save was flagged, in this session or before a restart) must not stay beside
       // it. What is removed is decided from what is stored NOW, never from what was remembered:
@@ -950,12 +975,13 @@ export class Mem0Memories {
   /** Change a memory in place: text, categories (replaces the set) and/or topic (null removes only
    *  the topic). At least one is required. `expected_rev` refuses a memory changed since the caller read it. */
   async update(id: string, change: UpdateInput) {
+    validatePageHook(change.hook);
     const text = change.text?.trim();
     if (change.text !== undefined && !text) throw new Error('text cannot be empty; delete_memory removes a memory.');
     if (change.title !== undefined && change.title.trim() && !cleanMemoryTitle(change.title)) throw new Error(TITLE_UNREADABLE);
     if (change.note !== undefined && change.note.trim() && !cleanEditNote(change.note)) throw new Error(NOTE_UNREADABLE);
-    if (text === undefined && change.title === undefined && change.categories === undefined && change.topic === undefined) {
-      throw new Error(`update_memory needs at least one change: text, title, categories or topic${change.note !== undefined ? ' (a note goes with one of them)' : ''}.`);
+    if (text === undefined && change.title === undefined && change.hook === undefined && change.categories === undefined && change.topic === undefined) {
+      throw new Error(`update_memory needs at least one change: text, title, hook, categories or topic${change.note !== undefined ? ' (a note goes with one of them)' : ''}.`);
     }
     const unknown = (change.categories ?? []).filter(c => !(MEM0_CATEGORIES as readonly string[]).includes(c));
     if (unknown.length) throw new Error(`Unknown categories: ${unknown.join(', ')}. Use one or more of: ${MEM0_CATEGORIES.join(', ')}.`);
@@ -967,6 +993,7 @@ export class Mem0Memories {
       ...(text !== undefined ? { text } : {}),
       ...(change.title !== undefined ? { title: change.title } : {}),
       ...(change.note !== undefined ? { note: change.note } : {}),
+      ...(change.hook !== undefined ? { hook: change.hook } : {}),
       ...(change.categories !== undefined ? { categories: change.categories } : {}),
       ...(change.topic !== undefined ? { topic: change.topic === null ? null : { topic: change.topic, type: change.topic_type, link: topicLinkOf(change.topic_link) } } : {}),
       ...(change.expected_rev !== undefined ? { expectedRev: change.expected_rev } : {}),
@@ -975,7 +1002,7 @@ export class Mem0Memories {
     const topic = edit.topic === undefined ? r.topic : edit.topic;
     const { relationDefaulted, parent: _parent, ...shown } = (topic ?? {}) as TopicResult;
     return {
-      message: edit.unchanged ? 'Nothing changed: the memory already is what this asked for.' : 'Memory updated successfully!', id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}),
+      message: edit.unchanged ? 'Nothing changed: the memory already is what this asked for.' : 'Memory updated successfully!', id: r.id, memory: r.text, ...(r.title ? { title: r.title } : {}), ...(r.hook ? { hook: r.hook } : {}),
       // The note of the edit that wrote it: an edit that wrote nothing saved none.
       ...(edit.unchanged ? (change.note?.trim() ? { note_not_set: 'Nothing changed, so the note was not saved.' } : {}) : r.note ? { note: r.note } : {}),
       filed: filedOf({ ...r, topic: topic ? shown : null }, new Map(), edit.parent),
@@ -1477,8 +1504,8 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
       ? 'Save one fact the person wants kept: something they ask you to remember, or a lasting preference, decision or fact they state about themselves or an account. Durable facts only, not raw attempts or working notes. '
       : 'Save one fact about the user, as you go and not only at the end of a task: a preference, a decision and why, a fact about an account, where things stand. Durable facts only, not raw attempts or working notes. ') +
       'By default a memory is one fact, readable on its own, in as many sentences as it needs, with what makes it useful later: who said or decided it and when (not when saved), the reason, the status. Every memory has a short `title` and neat Markdown text: a short fact is a clear paragraph or two; give longer text the shape it has (lists, bold labels, `code` for paths and commands). Never secrets, in a page or anywhere else. ' +
-      'Each topic has one page: a memory filed on that topic whose title is exactly the topic\'s name (the person\'s own page: no topic and no app_id, titled "You"). It is what the person reads when they open that topic in the Decoy app. Facts stay in their own memories; the page explains them like a Wikipedia article (neutral, third person, the person by first name, absolute dates): a short lead on what the subject is and where it stands now, then `##` sections, and every fact links the memory it comes from, `[booked for the week of Dec 14](memory:<memory_id>)`. After saving a fact on a topic, update its page in the same turn (update_memory); a topic with no page gets one here. A page carries no categories (any sent with one are not set), so only an agent that reads its whole topic can read it, and it may state every fact filed on its topic. The Decoy app shows a page as its topic\'s page only while its last writer is the owner or a connection that holds memory.edit on it (on every memory, or on its topic), so a connection without that saves facts, not pages. A new page held as close to another memory is its own memory: call again with confirm_new. ' +
-      'Pages use lists, tables, to-dos (`- [ ] item`), callouts (`> [!NOTE]`; also TIP, IMPORTANT, WARNING, CAUTION) and toggles (any of those five, `> [!TIP]- Title` starts closed, `+` open). A callout notifies nobody: tell the person anything urgent. Link to another memory with `[its name](memory:<memory_id>)` when one depends on the other, and file related memories under a topic; do neither just to do it. Someone who cannot open the linked memory sees plain words with nothing to tap, and the link gives no access or way to ask for it. A linked id that answers not found may be deleted or not open to you: do not guess; tell the person if it matters. ' +
+      'Each topic has one page: a memory filed on that topic whose title is exactly the topic\'s name (the person\'s own page: no topic and no app_id, titled "You"). It is what the person reads when they open that topic in the Decoy app. Facts stay in their own memories; the page explains them like a Wikipedia article (neutral, third person, the person by first name, absolute dates): a short lead on what the subject is and where it stands now, then `##` sections, and every fact links the memory it comes from, `[booked for the week of Dec 14](memory:<memory_id>)`. After saving a fact on a topic, update its page in the same turn (update_memory); a topic with no page gets one here. A page carries no categories (any sent with one are not set), so only an agent that reads its whole topic can read it, and it may state every fact filed on its topic. The Decoy app shows a page as its topic\'s page only while its last writer is the owner or a connection that holds memory.edit on it (on every memory, or on its topic), so a connection without that saves facts, not pages. A new page held as close to another memory is its own memory: call again with confirm_new. ' + PAGE_WRITING_HELP + ' ' +
+      'Write pages in prose; use lists and tables only for things that are lists by nature, and to-dos (`- [ ] item`), callouts (`> [!NOTE]`; also TIP, IMPORTANT, WARNING, CAUTION) and toggles (any of those five, `> [!TIP]- Title` starts closed, `+` open). A callout notifies nobody: tell the person anything urgent. Link to another memory with `[its name](memory:<memory_id>)` when one depends on the other, and file related memories under a topic; do neither just to do it. Someone who cannot open the linked memory sees plain words with nothing to tap, and the link gives no access or way to ask for it. A linked id that answers not found may be deleted or not open to you: do not guess; tell the person if it matters. ' +
       'Where it goes: (1) a fact about a service the user has an account for is linked to that account (app_id); (2) a fact about a subject goes under a topic: list_topics first and reuse one that fits; (3) only a fact about the user themself takes neither. A fact about an account also goes under a topic when it belongs to that subject. ' +
       'The result says where each memory landed in `filed`: { under: "account" | "topic" | "user", id, name } (`parent` for a topic under another; `topic` beside an account), and has `not_linked` when app_id matched no account. Adding the same text again with an app_id that matches moves that memory to the account: the linked memory is saved first, then the older one is removed (`moved_from`). ' +
       'Example, six calls, one fact each: {text: "Cabinet order placed with Example Cabinets on 2026-03-02.", app_id: "Example Cabinets", categories: ["milestones"]}; ' +
@@ -1494,6 +1521,7 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
     inputSchema: {
       text: z.string().describe('One fact (or a page), in neat Markdown, in as many sentences as it needs: readable on its own, with who said or decided it and when, the reason and the status where they matter. Do not repeat the title as a first heading. Required even if `messages` is provided.'),
       title: z.string().max(400).optional().describe(MEMORY_TITLE_HELP),
+      hook: z.string().max(160).optional().describe(PAGE_HOOK_HELP),
       messages: z.array(z.object({ role: z.string(), content: z.string() })).optional()
         .describe('Structured conversation history with `role`/`content`. Use when you have multiple turns.'),
       user_id: z.string().optional().describe('Ignored: memories always belong to the account owner (default_user).'),
@@ -1515,7 +1543,7 @@ export function registerMem0Tools(server: McpServer, memories: Mem0Memories, opt
   }, guarded(changed(async (a: AddInput) => {
     // What pages need goes only to a connection known to save and edit every memory (as list_topics).
     const mayWrite = opts.mayWrite ? await opts.mayWrite().catch(() => null) : true;
-    const r = await memories.add({ text: a.text, title: a.title, messages: a.messages, app_id: a.app_id, metadata: a.metadata, categories: a.categories,
+    const r = await memories.add({ text: a.text, title: a.title, hook: a.hook, messages: a.messages, app_id: a.app_id, metadata: a.metadata, categories: a.categories,
       topic: a.topic, topic_type: a.topic_type, topic_link: a.topic_link, supersedes: a.supersedes, confirm_new: a.confirm_new }, opts.canSample(), mayWrite === true ? { listing: opts.listing } : null);
     if (r.results.length) opts.onSave?.();
     return r;
@@ -1567,12 +1595,13 @@ ${FILTER_EXAMPLES}
   }, guarded(async (a: { memory_id: string }) => memories.get(a.memory_id)));
 
   reg('update_memory', {
-    description: 'Change an existing memory in place (same memory_id): its text, its title, its categories, or the topic it is filed under. The result says where the memory is in `filed`. When a fact changes (a new date, a new status), update the original here instead of adding a contradicting copy: read it, then pass its rev as expected_rev. Text is replaced whole and the owner can tick a page\'s to-dos, so re-read first, send expected_rev, and keep the ticks. Changing a box in your text is an edit like any other. A topic\'s page (the memory on it titled its name) is kept here: after saving a fact on the topic, update the page in the same turn so it states and links the new memory; if it changed since you read it, read it again and merge. Give every page edit a `note`. Also use it to file a memory under a topic; never save a copy instead. You can change what you saved while you hold memory.save, and any other memory you hold memory.edit on; a topic or category you add or remove must be one you can write.',
+    description: 'Change an existing memory in place (same memory_id): its text, its title, its categories, or the topic it is filed under. The result says where the memory is in `filed`. When a fact changes (a new date, a new status), update the original here instead of adding a contradicting copy: read it, then pass its rev as expected_rev. Text is replaced whole and the owner can tick a page\'s to-dos, so re-read first, send expected_rev, and keep the ticks. Changing a box in your text is an edit like any other. A topic\'s page (the memory on it titled its name) is kept here: after saving a fact on the topic, update the page in the same turn so it states and links the new memory; if it changed since you read it, read it again and merge. Give every page edit a `note`. Also use it to file a memory under a topic; never save a copy instead. You can change what you saved while you hold memory.save, and any other memory you hold memory.edit on; a topic or category you add or remove must be one you can write. ' + PAGE_WRITING_HELP,
     inputSchema: {
       memory_id: z.string().describe('Exact memory_id to change.'),
       text: z.string().optional().describe('Replacement text for the memory: the whole fact as it now stands, readable on its own (what changed, and when); for a page, the whole page.'),
       title: z.string().max(400).optional().describe(MEMORY_TITLE_HELP + ' An empty string removes it; leaving this out keeps it.'),
-      note: z.string().max(400).optional().describe('A few plain words, no Markdown, saying what this edit changed, e.g. "Added the Dec 14 booking". Give one on every page edit. It is sealed with the memory beside its title, at most 200 characters; each edit replaces it, and an edit without one removes it. It goes with a change (text, title, categories or topic), not alone.'),
+      hook: z.string().max(160).optional().describe(PAGE_HOOK_HELP),
+      note: z.string().max(400).optional().describe('A few plain words, no Markdown, saying what this edit changed, e.g. "Added the Dec 14 booking". Give one on every page edit. It is sealed with the memory beside its title, at most 200 characters; each edit replaces it, and an edit without one removes it. It goes with a change (text, title, hook, categories or topic), not alone.'),
       categories: z.array(z.enum(MEM0_CATEGORIES)).optional().describe('Replaces the memory\'s categories. A page carries none: any sent for one are not set.'),
       topic: z.string().max(200).nullable().optional()
         .describe('File it under this topic (a name or "topic:<id>"; created if you can read none by that name), or null to remove only the topic; its account stays.'),

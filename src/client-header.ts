@@ -23,7 +23,7 @@ export const CLIENT_HEADER = 'X-Decoy-Client';
 export const CLIENT_NAME = 'decoy-mcp-server';
 export const EXTENSION_CLIENT_NAME = 'decoy-desktop-extension';
 
-export function clientHeaderValue(version: string, mode?: 'context' | 'call' | 'hook', name: string = CLIENT_NAME): string {
+export function clientHeaderValue(version: string, mode?: 'context' | 'call' | 'hook' | 'run', name: string = CLIENT_NAME): string {
   return `${name}/${version}${mode ? `; mode=${mode}` : ''}`;
 }
 

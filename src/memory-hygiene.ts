@@ -16,6 +16,8 @@
 // A one-shot `call` is one process per tool call. There a session starts from the counts the
 // last call left (`initial`) and hands back its own (`counts()`); src/session-state.ts keeps them.
 
+import { MEMORY_FACT_PHRASE } from './agent-setup.js';
+
 /** Tool calls that are not memory tools, with no memory read, before the session is told to read. */
 export const READ_NUDGE_AFTER = 3;
 /** The same, for a session that was sent the summary: it has just been handed what is known. */
@@ -73,6 +75,40 @@ export function readsAllMemories(access: unknown): boolean {
   return !!m && typeof m === 'object' && (m as { read?: unknown }).read === 'all';
 }
 
+/** Data from this connection's GET /policies answer, never server-authored advice. */
+export interface MemoryHabit {
+  /** Absent on older APIs. */
+  connected_at?: string;
+  last_saved_at: string | null;
+  active_days_since_last_save: number;
+  active_days_last_7: number;
+}
+export function memoryHabit(answer: unknown): MemoryHabit | null {
+  const h = answer && typeof answer === 'object' ? (answer as { memory_habit?: unknown }).memory_habit : null;
+  if (!h || typeof h !== 'object' || Array.isArray(h)) return null;
+  const { connected_at: connected, last_saved_at: at, active_days_since_last_save: since, active_days_last_7: week } = h as Record<string, unknown>;
+  const count = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+  const date = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$/.test(v) && Number.isFinite(Date.parse(v));
+  if ((at !== null && !date(at)) || (connected !== undefined && !date(connected))) return null;
+  if (!count(since) || !count(week) || week > 7) return null;
+  return { ...(connected === undefined ? {} : { connected_at: connected as string }), last_saved_at: at as string | null, active_days_since_last_save: since, active_days_last_7: week };
+}
+/** The bridge owns every word; only validated dates and counts come from the API. */
+export function saveDueLine(h: MemoryHabit | null, ability: MemoryAbility | null, now = Date.now()): string | null {
+  if (!ability?.save || !h) return null;
+  // Reading policies is current connection use. The first recorded day must not hide an old
+  // connection's history just because activity counting started at deployment.
+  const oldOnReturn = h.active_days_since_last_save > 0 && h.active_days_last_7 > 0 &&
+    (h.last_saved_at !== null ? now - Date.parse(h.last_saved_at) > 7 * 86_400_000
+      : h.connected_at !== undefined && now - Date.parse(h.connected_at) > 2 * 86_400_000);
+  if (h.active_days_since_last_save < 2 && !oldOnReturn) return null;
+  const days = h.active_days_since_last_save;
+  const age = h.last_saved_at === null ? null : Math.max(0, Math.floor((now - Date.parse(h.last_saved_at)) / 86_400_000));
+  const when = age === null ? `has never saved and has been used on ${days} active ${days === 1 ? 'day' : 'days'}`
+    : `last saved ${age} ${age === 1 ? 'day' : 'days'} ago and has been used on ${days} ${days === 1 ? 'day' : 'days'} since`;
+  return `Decoy memory: this connection ${when}. Before you finish this task, save what you have learned about the owner since then: from this chat, from your own saved memory of them, and from earlier chats you can see. Save ${MEMORY_FACT_PHRASE}.`;
+}
+
 type BriefState = 'not_started' | 'loading' | 'told_loading' | 'delivered' | 'nothing_to_send' | 'not_sent';
 
 /** A session's numbers and flags, as they can be handed from one process to the next. The summary
@@ -106,6 +142,7 @@ export class MemorySession {
   private firstStepSaid = false;
   private toldLoading = false;
   private ability: MemoryAbility | null = null;
+  private habit: MemoryHabit | null = null;
   private abilityKnown!: (a: MemoryAbility | null) => void;
   private readonly firstAbility = new Promise<MemoryAbility | null>((resolve) => { this.abilityKnown = resolve; });
 
@@ -113,6 +150,7 @@ export class MemorySession {
     /** A listed hosted connector: nothing is ever added after a result (no summary, no reminder,
      *  no first-step line); the session's numbers are still counted. */
     quiet?: boolean;
+    now?: () => number;
     /** The summary (empty when there are no memories), given what the connection may do with
      *  memories when that is known. Called at most once. */
     brief: (ability: MemoryAbility | null) => Promise<string>;
@@ -163,6 +201,9 @@ export class MemorySession {
     this.abilityKnown(ability);
   }
 
+  /** The most recent validated saving data for this connection. */
+  sawHabit(habit: MemoryHabit | null): void { if (habit) this.habit = habit; }
+
   /** What the connection may do with memories, waiting for the first look if it has not answered. */
   async abilityNow(): Promise<MemoryAbility | null> {
     return this.ability ?? this.firstAbility;
@@ -187,10 +228,20 @@ export class MemorySession {
   }
 
   /** Something was written to memory (a save or a correction). */
-  saved(): void { this.saves++; }
+  saved(): void { this.saves++; if (this.habit) this.habit = { ...this.habit, last_saved_at: new Date((this.opts.now ?? Date.now)()).toISOString(), active_days_since_last_save: 0 }; }
 
   /** A tool has answered. Returns the one line (or the summary) to put after its result, if any. */
   async end(tool: string, ok: boolean): Promise<string | null> {
+    // Set the existing save flag before considering the eight-call reminder. The due note can
+    // share the first result's summary/read note, but replaces SAVE_NUDGE for this whole session.
+    const due = ok && !this.opts.quiet && !this.saveNudged && this.saves === 0
+      ? saveDueLine(this.habit, this.ability, (this.opts.now ?? Date.now)()) : null;
+    if (due) this.saveNudged = true;
+    const note = await this.ordinaryEnd(tool, ok);
+    return [note, due].filter(Boolean).join('\n') || null;
+  }
+
+  private async ordinaryEnd(tool: string, ok: boolean): Promise<string | null> {
     if (!ok) return null;
     if (this.opts.quiet) { if (MEMORY_READ_TOOLS.has(tool)) this.reads++; return null; }
     if (MEMORY_READ_TOOLS.has(tool)) {
@@ -247,6 +298,7 @@ export class MemorySession {
     const said = [this.readNudged ? 'to read memory' : '', this.saveNudged ? 'to save' : ''].filter(Boolean);
     return `Memory in this session: ${n(this.toolCalls, 'tool call', 'tool calls')}, ${n(this.reads, 'memory read', 'memory reads')}, ` +
       `${n(this.saves, 'memory saved or corrected', 'memories saved or corrected')}. Summary of memories: ${brief[this.brief]}. ` +
-      `Reminders sent: ${said.length ? said.join(', ') : 'none'}.`;
+      `Reminders sent: ${said.length ? said.join(', ') : 'none'}.` +
+      (this.habit ? ` Last saved by this connection: ${this.habit.last_saved_at ?? 'never'}.` : '');
   }
 }

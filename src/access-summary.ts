@@ -1,3 +1,4 @@
+import { memoryHabit } from './memory-hygiene.js';
 // What this connection may do, in plain words: the first lines of my_permissions.
 //
 // GET /policies starts with capability scopes, which have no entry for memories at all: an agent
@@ -724,7 +725,7 @@ export function withAccessFirst(response: unknown, now: Date = new Date()): Reco
       ? ' It ends within 7 days: to keep it, ask again with request_access (the same permissions and selection); the owner is asked to keep it.'
       : ' To keep it, ask again with request_access in its last 7 days; earlier, the same ask answers already_granted and reaches no one.';
   }
-  return { summary: lines, access, policies, implicit, ...rest };
+  return { summary: lines, access, policies, implicit, ...rest, ...(memoryHabit(response) ? { memory_habit: memoryHabit(response) } : {}) };
 }
 
 /** Where the fingerprint a bridge last saw is kept between runs (a file-based connection only). */

@@ -7,7 +7,7 @@
 //                  this process, on the person's computer: the prompt never leaves it, and Decoy
 //                  sees one ordinary read of the (encrypted) memories;
 //   stop           when the exchange held something lasting, the agent takes one more turn to save
-//                  it itself, through Decoy's own tools: one fact per memory, nothing when nothing
+//                  it itself, through Decoy's own tools: separate facts, nothing when nothing
 //                  lasts. No conversation text is sent anywhere by the hook;
 //   pre-tool       Decoy's own memory reads and saves run without a permission prompt (never a
 //                  delete, never another tool).
@@ -21,6 +21,12 @@
 import { createHash } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, fstatSync } from 'node:fs';
 import { join } from 'node:path';
+import fs from 'node:fs';
+import { memoryAbility, memoryHabit } from './memory-hygiene.js';
+import { withAccessFirst } from './access-summary.js';
+import { readSecretFile, readSecretFileIn, writeSecretFile, writeSecretFileIn, withFileLock } from './secret-file.js';
+import { sessionFileName } from './session-state.js';
+import { MEMORY_FACT_PHRASE } from './agent-setup.js';
 
 export const HOOK_HOSTS = ['claude-code', 'codex', 'gemini-cli', 'antigravity', 'cursor'] as const;
 export type HookHost = typeof HOOK_HOSTS[number];
@@ -218,20 +224,21 @@ export interface HookState {
   counts: { recalls: number; checks: number };
 }
 
-export const SAVE_CHECK_REASON = 'Before you finish: if the person stated a lasting preference, decision, correction or fact in this exchange that is not saved in Decoy yet, save it now with add_memory: one fact per memory, with who said or decided it and when, and never a secret. If nothing lasting came up, or it is saved already, end your turn without saving and without mentioning this.';
-export const PERIODIC_CHECK_REASON = 'Before you finish: if anything lasting came up in the last few exchanges (a preference, a decision, a correction, a fact about the person or an account) that is not saved in Decoy yet, save it now with add_memory: one fact per memory, with who said or decided it and when, and never a secret. If nothing lasting came up, or it is saved already, end your turn without saving and without mentioning this.';
+export const SAVE_CHECK_REASON = `Before you finish: if the person stated a lasting preference, decision, correction or fact in this exchange that is not saved in Decoy yet, save it now with add_memory: ${MEMORY_FACT_PHRASE}, with who said or decided it and when, and never a secret. If nothing lasting came up, or it is saved already, end your turn without saving and without mentioning this.`;
+export const PERIODIC_CHECK_REASON = `Before you finish: if anything lasting came up in the last few exchanges (a preference, a decision, a correction, a fact about the person or an account) that is not saved in Decoy yet, save it now with add_memory: ${MEMORY_FACT_PHRASE}, with who said or decided it and when, and never a secret. If nothing lasting came up, or it is saved already, end your turn without saving and without mentioning this.`;
 /** No two checks closer than this. */
 export const CHECK_COOLDOWN_MS = 120_000;
 /** A check after this many prompts with none, whatever they said. */
 export const PERIODIC_AFTER_PROMPTS = 12;
 
-export function decideSaveCheck(state: HookState, input: { loopGuard: boolean; savedThisTurn: boolean }, now: number): { reason: string | null; state: HookState } {
+export function decideSaveCheck(state: HookState, input: { loopGuard: boolean; savedThisTurn: boolean; saveDue?: boolean }, now: number): { reason: string | null; state: HookState } {
   const quiet = (s: HookState) => ({ reason: null, state: s });
   if (input.loopGuard) return quiet({ ...state, cuePending: false });
   if (input.savedThisTurn) return quiet({ ...state, cuePending: false, promptsSinceCheck: 0 });
   // A lasting statement made during the cooldown stays pending: it is asked about once the cooldown ends.
   if (now - state.lastCheckAt < CHECK_COOLDOWN_MS) return quiet(state);
   const asked = (reason: string) => ({ reason, state: { ...state, cuePending: false, lastCheckAt: now, promptsSinceCheck: 0, counts: { ...state.counts, checks: state.counts.checks + 1 } } });
+  if (input.saveDue) return asked(SAVE_DUE_REASON);
   if (state.cuePending) return asked(SAVE_CHECK_REASON);
   if (state.promptsSinceCheck >= PERIODIC_AFTER_PROMPTS) return asked(PERIODIC_CHECK_REASON);
   return quiet(state);
@@ -445,4 +452,93 @@ export function openHookState(dir: string, host: HookHost, sessionId: string): {
       }
     },
   };
+}
+
+// ── Connection-wide bookkeeping for the existing stop event ───────────────────────────────
+
+export const STOP_DEADLINE_MS = 3_000;
+export const SAVE_DUE_COOLDOWN_MS = 20 * 60 * 60_000;
+export const SAVE_DUE_REASON = 'Before you stop, save what you have learned about the owner in this task and since this connection last saved: from this chat, your own saved memory of them, and earlier chats you can see. One lasting fact per memory, with who said or decided it and when. Update changed facts; leave out secrets and repository contents. If nothing lasting is new, finish without saving.';
+
+interface StopHookState { v: 1; last_run_at: string; last_asked_at: string | null }
+export interface StopHookStore {
+  readonly file: string;
+  ran(): boolean;
+  askedRecently(now: Date, cooldownMs: number): boolean;
+  markRun(now: Date): Promise<boolean>;
+  claimAsk(now: Date, cooldownMs: number): Promise<boolean>;
+}
+const TIME = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+function parse(text: string): StopHookState | null {
+  if (text.length > 512) return null;
+  try {
+    const s = JSON.parse(text);
+    const time = (v: unknown) => typeof v === 'string' && TIME.test(v) && Number.isFinite(Date.parse(v));
+    if (!s || Object.keys(s).sort().join(',') !== 'last_asked_at,last_run_at,v' || s.v !== 1 || !time(s.last_run_at) || (s.last_asked_at !== null && !time(s.last_asked_at))) return null;
+    return s;
+  } catch { return null; }
+}
+export function openStopHookStore(o: { dir: string; own: boolean; keyFingerprint: string }): StopHookStore {
+  const key = sessionFileName(o.keyFingerprint).split('.')[1];
+  const file = join(o.dir, `mcp-stop-hook.${key}.json`);
+  const read = () => {
+    try { if (fs.lstatSync(file).size > 512) return null; } catch { return null; }
+    return parse((o.own ? readSecretFile(file) : readSecretFileIn(file)) ?? '');
+  };
+  const change = async (now: Date, cooldownMs?: number): Promise<boolean> => {
+    let claimed = false;
+    try {
+      const lock = await withFileLock(file, async () => {
+        const held = read();
+        if (cooldownMs !== undefined && held?.last_asked_at && now.getTime() - Date.parse(held.last_asked_at) < cooldownMs) return;
+        const state: StopHookState = { v: 1, last_run_at: now.toISOString(), last_asked_at: cooldownMs === undefined ? held?.last_asked_at ?? null : now.toISOString() };
+        const text = JSON.stringify(state) + '\n';
+        if (o.own) writeSecretFile(file, text); else writeSecretFileIn(file, text);
+        claimed = true;
+      }, { waitMs: 100, staleMs: 10_000, pollMs: 10 });
+      return lock.held && claimed;
+    } catch { return false; }
+  };
+  return { file, ran: () => { try { return read() !== null; } catch { return false; } },
+    askedRecently: (now, cooldownMs) => { try { const s = read(); return !!s?.last_asked_at && now.getTime() - Date.parse(s.last_asked_at) < cooldownMs; } catch { return false; } },
+    markRun: (now) => change(now), claimAsk: (now, cooldownMs) => change(now, cooldownMs) };
+}
+
+/** Logout removes only our own timestamp files, never following links. */
+export function removeStopHookFiles(dir: string, keyFingerprint?: string): string[] {
+  const only = keyFingerprint ? `mcp-stop-hook.${sessionFileName(keyFingerprint).split('.')[1]}.json` : null;
+  const removed: string[] = [];
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!/^mcp-stop-hook\.[0-9a-f]{16}\.json$/.test(name) || (only && name !== only)) continue;
+      const file = join(dir, name);
+      if (!fs.lstatSync(file).isFile()) continue;
+      fs.rmSync(file, { force: true }); removed.push(file);
+    }
+  } catch { /* no state to remove */ }
+  return removed;
+}
+
+/** The exchange check remains local and independent of policies availability. Only the added
+ *  overdue condition reads policies and needs a durable connection-wide claim. Both go through
+ *  decideSaveCheck's existing loop guard, saved-this-turn check and two-minute cooldown. */
+export async function stopEvent(state: HookState, input: { loopGuard: boolean; savedThisTurn: boolean }, deps: {
+  store: StopHookStore | null;
+  policies(): Promise<unknown>;
+  now?: () => number;
+}): Promise<{ reason: string | null; state: HookState }> {
+  const now = (deps.now ?? Date.now)();
+  const exchange = decideSaveCheck(state, input, now);
+  try {
+    const store = deps.store;
+    if (!store || !await store.markRun(new Date(now))) return exchange;
+    if (exchange.reason || input.loopGuard || input.savedThisTurn || now - state.lastCheckAt < CHECK_COOLDOWN_MS) return exchange;
+    if (store.askedRecently(new Date(now), SAVE_DUE_COOLDOWN_MS)) return exchange;
+    const answer = await deps.policies();
+    const habit = memoryHabit(answer);
+    if (!habit || !memoryAbility(withAccessFirst(answer, new Date(now)).access)?.save) return exchange;
+    if (habit.last_saved_at !== null && now - Date.parse(habit.last_saved_at) < SAVE_DUE_COOLDOWN_MS) return exchange;
+    const due = decideSaveCheck(state, { ...input, saveDue: true }, now);
+    return due.reason && await store.claimAsk(new Date(now), SAVE_DUE_COOLDOWN_MS) ? due : exchange;
+  } catch { return exchange; }
 }

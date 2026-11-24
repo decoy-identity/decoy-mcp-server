@@ -224,6 +224,8 @@ export interface MemoryChange {
   text?: string; /** Blank clears it. */ title?: string;
   /** One line saying what this edit changed. It belongs to this edit: a write without one removes the last. */
   note?: string;
+  /** The page's Did you know line. Omitted keeps it; blank removes it. */
+  hook?: string;
   categories?: string[]; addCategories?: string[]; topic?: TopicSpec | null; expectedRev?: number;
   /** Decides, from the memory as this edit would leave it and everything this connection reads,
    *  whether the edit goes ahead as asked, goes ahead with no categories (`untag`), or is refused
@@ -304,7 +306,7 @@ const outcomeUnknown = (id: string) => Object.assign(new Error(`Decoy did not co
 interface Opened { row: WireRow; space: SpaceInfo | null; value: Record<string, unknown>; key: Buffer }
 /** A memory about to be saved: its plaintext and the labels that decide who may read it. */
 interface NewRow { id: string; value: Record<string, unknown>; facts: Omit<MemoryFacts, 'row_id'> }
-interface NewMemory { text: string; title?: string; metadata?: Record<string, unknown>; categories?: string[] }
+interface NewMemory { text: string; title?: string; hook?: string; metadata?: Record<string, unknown>; categories?: string[] }
 
 /** A memory's optional title, sealed beside the text. Untrusted like the text: one line, no control or direction characters, capped. */
 export function cleanMemoryTitle(raw: unknown): string | undefined {
@@ -315,6 +317,19 @@ export function cleanMemoryTitle(raw: unknown): string | undefined {
  *  one line saying what that edit changed, cleaned like the title, at most 200 characters. */
 export function cleanEditNote(raw: unknown): string | undefined {
   return cleanLine(raw, 200);
+}
+
+/** A page's optional hook, sealed beside its title. Never silently truncate a fact. */
+export function cleanPageHook(raw: unknown): string | undefined {
+  const hook = typeof raw === 'string' && raw.length <= 160 ? cleanLine(raw, 160) : undefined;
+  return hook?.replace(/[\p{Default_Ignorable_Code_Point}\s]/gu, '') ? hook : undefined;
+}
+
+/** Validate writes before sealing; reads discard malformed hooks from other clients. */
+export function validatePageHook(raw: string | undefined): void {
+  if (raw === undefined) return;
+  if (raw.length > 160) throw new Error('hook must be at most 160 characters.');
+  if (raw.trim() && !cleanPageHook(raw)) throw new Error('hook has no readable characters. Send one line in words, or "" to remove it.');
 }
 
 /** One line of untrusted text: no control or direction characters, at most `max` characters, cut on a word. */
@@ -343,6 +358,8 @@ export interface MemoryRecord {
   title?: string;
   /** The note of the edit that last wrote it, when that edit gave one. */
   note?: string;
+  /** The page's Did you know line, kept across edits until replaced or removed. */
+  hook?: string;
   entityName: string;
   accountId: string | null;
   mine: boolean;
@@ -686,7 +703,7 @@ export class ContextGraph {
     return `topic:${node.topicId}`;
   }
 
-  private static observationRow(node: { accountId: string | null; entity: { name: string } }, label: string, content: string, extra: { title?: string; metadata?: Record<string, unknown>; categories?: string[]; aboutHint?: string } = {}): NewRow {
+  private static observationRow(node: { accountId: string | null; entity: { name: string } }, label: string, content: string, extra: { title?: string; hook?: string; metadata?: Record<string, unknown>; categories?: string[]; aboutHint?: string } = {}): NewRow {
     const categories = [...new Set(extra.categories ?? [])];
     return {
       id: randomUUID(),
@@ -695,6 +712,7 @@ export class ContextGraph {
         observation: node.accountId ? { content } : { entityName: node.entity.name, content },
         about: [label],
         ...(extra.title ? { title: extra.title } : {}),
+        ...(extra.hook ? { hook: extra.hook } : {}),
         ...(categories.length ? { categories } : {}),
         ...(extra.aboutHint ? { about_hint: extra.aboutHint } : {}),
         ...(extra.metadata ? { metadata: extra.metadata } : {}),
@@ -715,7 +733,7 @@ export class ContextGraph {
 
   /** Seal each row under its own key and save it: wrapped to the owner, to this agent, and to every
    *  other connection whose grant reaches it (no grant is needed to save). */
-  private async saveRows(rows: NewRow[]): Promise<void> {
+  private async saveRows(rows: NewRow[], origin?: 'activity'): Promise<void> {
     if (!rows.length) return;
     const keys = await this.deps.call<Grantees>('/context/memory-grantees');
     if (!keys.owner_public_key) throw new Error('The account owner has not finished key setup on a device yet, so context cannot be stored.');
@@ -727,7 +745,7 @@ export class ContextGraph {
         this.keyCache.set(`${r.id}:${kid}`, key);
         const facts = { row_id: r.id, ...r.facts };
         return {
-          id: r.id, kid,
+          id: r.id, kid, ...(origin ? { origin } : {}),
           ciphertext: this.deps.sealVault({ v: 2, row_id: r.id, ...r.value }, key),
           owner_wrap: sealEnvelopeForOwner(key.toString('base64'), keys.owner_public_key!),
           self_wrap: wrapKeyForRecipient(key, this.deps.ownPublicKey),
@@ -950,9 +968,10 @@ export class ContextGraph {
     const aboutHint = typeof o.value.about_hint === 'string' && o.value.about_hint ? o.value.about_hint : undefined;
     const title = cleanMemoryTitle(o.value.title);
     const note = cleanEditNote(o.value.note);
+    const hook = cleanPageHook(o.value.hook);
     const at = o.row.created_at ?? new Date(0).toISOString();
     return {
-      id: o.row.id, text: ob.content, ...(title ? { title } : {}), ...(note ? { note } : {}), entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
+      id: o.row.id, text: ob.content, ...(title ? { title } : {}), ...(note ? { note } : {}), ...(hook ? { hook } : {}), entityName, accountId: node?.accountId ?? o.space?.account_id ?? null, mine: o.row.mine,
       // A row that states no author is never taken for the owner's: this connection's own is an
       // agent's, and so is anyone else's until the server says otherwise.
       authorKind: o.row.author_kind ?? 'agent', rev: o.row.rev ?? 1,
@@ -1486,7 +1505,7 @@ export class ContextGraph {
    *  topic's rows go in the same request as the memories), and attach existing memories to that
    *  topic in place (`attach`: same ids, categories added). Attaching needs the right to edit each
    *  one; any this agent may not edit come back in `refused`. */
-  async saveMemories(items: NewMemory[], opts: { accountId?: string | null; aboutHint?: string; topic?: TopicSpec; attach?: { id: string; categories?: string[] }[] } = {}): Promise<{ written: MemoryRecord[]; attached: MemoryRecord[]; refused: string[]; topic: TopicResult | null }> {
+  async saveMemories(items: NewMemory[], opts: { accountId?: string | null; aboutHint?: string; topic?: TopicSpec; attach?: { id: string; categories?: string[]; rule?: MemoryChange['rule'] }[]; origin?: 'activity' } = {}): Promise<{ written: MemoryRecord[]; attached: MemoryRecord[]; refused: string[]; topic: TopicResult | null }> {
     const accountId = opts.accountId ?? null;
     return this.withLock(async () => {
       const g = await this.load();
@@ -1495,7 +1514,7 @@ export class ContextGraph {
       // someone else's is reported as a duplicate and left as it is (update_memory changes it on
       // purpose). Saving it gives no right to change it: like any relabel, it must stay inside what
       // this connection can write, checked before anything (the topic included) is written.
-      const attach: { id: string; categories?: string[]; perms: ServedPermission[] | null }[] = [], refused: { id: string; categories?: string[] }[] = [];
+      const attach: { id: string; change: MemoryChange; perms: ServedPermission[] | null }[] = [], refused: { id: string }[] = [];
       const candidates = opts.topic ? (opts.attach ?? []).filter(a => {
         const o = g.opened.find(x => x.row.id === a.id);
         if (o && o.row.mine && !o.space) return true;
@@ -1511,9 +1530,16 @@ export class ContextGraph {
         const record = this.recordsOf(g).find(r => r.id === a.id);
         // It needs write on the memory as it is too (the server decides when the grants can't be read).
         if (!record || (held && !record.via.some(v => viaHeld(held, v, 'write')))) { refused.push(a); continue; }
+        let change: MemoryChange = { addCategories: a.categories };
+        const verdict = await a.rule?.({
+          before: record, title: record.title, topicName: topic!.name, topicId: topic!.id, topicCreated: topic!.created,
+          readsWhole: () => this.readsWholeIn(g, topic!.created ? null : topic!.id),
+        });
+        if (verdict?.refuse) throw new Error(verdict.refuse);
+        if (verdict?.untag) change = { categories: [], addCategories: [] };
         try {
-          const perms = await this.assertInsideWriteSet(record, ContextGraph.nextLabels(record, { addCategories: a.categories }, topic), topic!.created ? [topic!.id] : []);
-          attach.push({ ...a, perms });
+          const perms = await this.assertInsideWriteSet(record, ContextGraph.nextLabels(record, change, topic), topic!.created ? [topic!.id] : []);
+          attach.push({ id: a.id, change, perms });
         } catch (err) {
           if ((err as { code?: string } | null)?.code !== OUTSIDE_WRITE_SET) throw err;
           refused.push(a);
@@ -1538,17 +1564,17 @@ export class ContextGraph {
       }
       const first = rows.length;
       for (const it of items) {
-        const row = ContextGraph.observationRow(node, label, it.text, { title: cleanMemoryTitle(it.title), metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint });
+        const row = ContextGraph.observationRow(node, label, it.text, { title: cleanMemoryTitle(it.title), hook: cleanPageHook(it.hook), metadata: it.metadata, categories: it.categories, aboutHint: accountId ? undefined : opts.aboutHint });
         // Account first keeps older clients that read only the first label on the account.
         if (accountId && topic) row.value.about = row.facts.about = [label, topic.id];
         rows.push(row);
       }
-      await this.saveRows(rows);
+      await this.saveRows(rows, opts.origin);
       const now = new Date().toISOString();
       const written = rows.slice(first).map((r, i): MemoryRecord => {
         const cats = r.value.categories as string[] | undefined;
         return {
-          id: r.id, text: items[i].text, ...(r.value.title ? { title: r.value.title as string } : {}), entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
+          id: r.id, text: items[i].text, ...(r.value.title ? { title: r.value.title as string } : {}), ...(r.value.hook ? { hook: r.value.hook as string } : {}), entityName: node.entity.name, accountId, mine: true, authorKind: 'agent' as const, rev: 1,
           createdAt: now, updatedAt: now, ...(items[i].metadata ? { metadata: items[i].metadata } : {}),
           ...(cats ? { categories: cats } : {}), ...(r.value.about_hint ? { aboutHint: r.value.about_hint as string } : {}),
           topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null,
@@ -1560,7 +1586,7 @@ export class ContextGraph {
       for (const a of topic ? attach : []) {
         const rev = this.recordsOf(g).find(r => r.id === a.id)?.rev ?? 0;
         try {
-          attached.push((await this.applyEdit(g, a.id, { addCategories: a.categories }, topic, a.perms)).record);
+          attached.push((await this.applyEdit(g, a.id, a.change, topic, a.perms)).record);
         } catch (err) {
           if (definitelyRefused(err)) refused.push(a); else unknown.push({ id: a.id, rev });
         }
@@ -1665,6 +1691,7 @@ export class ContextGraph {
           && (change.text === undefined || now.text === change.text)
           && (change.title === undefined || now.title === cleanMemoryTitle(change.title))
           && now.note === cleanEditNote(change.note)
+          && now.hook === (change.hook === undefined ? record.hook : cleanPageHook(change.hook))
           && (topic === undefined || (now.topic?.id ?? null) === (topic?.id ?? null));
         if (!landed) throw outcomeUnknown(id);
         return { record: now, rotated: false, reconciled: true, ...(topic !== undefined ? { topic } : {}), ...(parent ? { parent } : {}) };
@@ -1798,7 +1825,7 @@ export class ContextGraph {
     const nextTitle = change.title === undefined ? record.title : cleanMemoryTitle(change.title);
     if (change.title !== undefined) {
       // Setting the title it already has, and nothing else: no write, no new revision.
-      const titleOnly = change.text === undefined && !change.categories && !change.addCategories?.length && topic === undefined;
+      const titleOnly = change.text === undefined && change.hook === undefined && !change.categories && !change.addCategories?.length && topic === undefined;
       if (titleOnly && nextTitle === record.title) return { record, rotated: false, unchanged: true };
       if (nextTitle) value.title = nextTitle;
       else delete value.title;
@@ -1807,6 +1834,11 @@ export class ContextGraph {
     const nextNote = cleanEditNote(change.note);
     if (nextNote) value.note = nextNote;
     else delete value.note;
+    const nextHook = change.hook === undefined ? record.hook : cleanPageHook(change.hook);
+    if (change.hook !== undefined) {
+      if (nextHook) value.hook = nextHook;
+      else delete value.hook;
+    }
     const oldCats = record.categories ?? [];
     const { categories: cats, about } = ContextGraph.nextLabels(record, change, topic);
     if (change.categories || change.addCategories?.length) value.categories = cats;
@@ -1818,7 +1850,7 @@ export class ContextGraph {
     value.observation = ob;
     const newAbout = (Array.isArray(value.about) ? value.about : []).filter((a): a is string => typeof a === 'string');
     const result = (rev: number, updatedAt: string): MemoryRecord => ({
-      ...record, text, title: nextTitle, note: nextNote, rev, updatedAt, categories: cats, about: newAbout,
+      ...record, text, title: nextTitle, note: nextNote, hook: nextHook, rev, updatedAt, categories: cats, about: newAbout,
       ...(topic !== undefined ? { topic: topic ? { id: topic.id, name: topic.name, type: topic.type } : null, entityName: record.accountId ? record.entityName : topic ? topic.name : USER_ENTITY } : {}),
     });
 

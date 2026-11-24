@@ -1,7 +1,7 @@
 // Decoy's guidance for agents changes; a connection is told the newest change once.
 //
 // The newest entry of www.decoys.me/agent-guidance.json (`changes`: { date, summary, pages }) becomes
-// one line of the brief: "Decoy's guidance changed on <date>: <summary> (read <url>)". It is said
+// one line of the brief asking to re-read its pages and keep memories and pages current. It is said
 // until this connection has been shown it, then not again until a newer change is published.
 //
 // The file is fetched with a plain GET (no token, no cookie, nothing about the person), at most
@@ -19,6 +19,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { oneLine } from './context-graph.js';
 import { readSecretFile, writeSecretFile } from './secret-file.js';
+import { PLAIN_VERSION } from './api-error.js';
 
 /** Where Decoy publishes its guidance for agents. */
 export const GUIDANCE_URL = 'https://www.decoys.me/agent-guidance.json';
@@ -68,7 +69,7 @@ export function newestChange(doc: unknown): GuidanceChange | null {
 }
 
 /** The brief's line for a change. */
-export const guidanceLine = (c: GuidanceChange): string => `Decoy's guidance changed on ${c.date}: ${c.summary} (read ${c.url})`;
+export const guidanceLine = (c: GuidanceChange): string => `Decoy's guidance changed on ${c.date}. Re-read the pages at ${c.url} and bring the person's memories and pages up to date.`;
 
 /** Whether a change is newer than the one last shown (null: none shown yet). */
 export function isNewer(change: GuidanceChange, shown: string | null): boolean {
@@ -80,6 +81,8 @@ export function isNewer(change: GuidanceChange, shown: string | null): boolean {
 export interface GuidanceFeed {
   /** The newest change, when it has arrived within `waitMs`; null when there is none or not yet. */
   newest(waitMs: number): Promise<GuidanceChange | null>;
+  /** A released bridge version from the same document, independent of its change history. */
+  latestBridge?(waitMs: number): Promise<string | null>;
 }
 
 /** The guidance file, fetched when first asked for and then at most once per GUIDANCE_KEEP_MS. */
@@ -88,52 +91,58 @@ export function guidanceFeed(opts: { url?: string; fetch?: typeof fetch; now?: (
   cacheFile?: string | null } = {}): GuidanceFeed {
   const url = opts.url ?? GUIDANCE_URL;
   const now = opts.now ?? Date.now;
-  let held: { at: number; answer: Promise<GuidanceChange | null> } | null = null;
+  type Facts = { change: GuidanceChange | null; latest: string | null };
+  const release = (v: unknown): string | null => typeof v === 'string' && PLAIN_VERSION.test(v) ? v : null;
+  const empty: Facts = { change: null, latest: null };
+  let held: { at: number; answer: Promise<Facts> } | null = null;
   /** What another process fetched within the hour, if anything is kept. */
-  const kept = (): { at: number; change: GuidanceChange | null } | null => {
+  const kept = (): { at: number; facts: Facts } | null => {
     if (!opts.cacheFile) return null;
     try {
-      const o = JSON.parse(readSecretFile(opts.cacheFile) ?? 'null') as { at?: unknown; change?: unknown } | null;
+      const o = JSON.parse(readSecretFile(opts.cacheFile) ?? 'null') as { at?: unknown; change?: unknown; latest?: unknown } | null;
       if (!o || typeof o.at !== 'number' || !Number.isFinite(o.at) || o.at > now()) return null;
       // Read back through the same checks as the file itself.
       const change = o.change === null ? null : newestChange({ changes: [o.change] });
       if (o.change !== null && !change) return null;
-      return { at: o.at, change };
+      return { at: o.at, facts: { change, latest: release(o.latest) } };
     } catch { return null; }
   };
-  const keep = (at: number, change: GuidanceChange | null) => {
+  const keep = (at: number, { change, latest }: Facts) => {
     if (!opts.cacheFile) return;
     const raw = change ? { date: change.date, summary: change.summary, pages: [change.url.startsWith(`${SITE}/`) && change.url !== GUIDANCE_URL ? change.url.slice(SITE.length) : ''] } : null;
-    try { writeSecretFile(opts.cacheFile, `${JSON.stringify({ at, change: raw })}\n`); } catch { /* this process only */ }
+    try { writeSecretFile(opts.cacheFile, `${JSON.stringify({ at, change: raw, latest })}\n`); } catch { /* this process only */ }
   };
-  const load = async (): Promise<GuidanceChange | null> => {
+  const load = async (): Promise<Facts> => {
     try {
       const res = await (opts.fetch ?? fetch)(url, { headers: { accept: 'application/json' }, redirect: 'follow', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       // Only Decoy's own site answers for it, after any redirect.
       const from = res.url ? new URL(res.url) : new URL(url);
-      if (!res.ok || from.protocol !== 'https:' || !/(^|\.)decoys\.me$/.test(from.hostname)) return null;
+      if (!res.ok || from.protocol !== 'https:' || !/(^|\.)decoys\.me$/.test(from.hostname)) return empty;
       // Said too large before it is read, when the answer says how large it is.
-      if (Number(res.headers?.get?.('content-length') ?? 0) > MAX_CHARS) return null;
+      if (Number(res.headers?.get?.('content-length') ?? 0) > MAX_CHARS) return empty;
       const text = await res.text();
-      if (text.length > MAX_CHARS) return null;
-      return newestChange(JSON.parse(text));
-    } catch { return null; }
+      if (text.length > MAX_CHARS) return empty;
+      const doc = JSON.parse(text);
+      return { change: newestChange(doc), latest: release(doc?.bridge?.latest) };
+    } catch { return empty; }
+  };
+  const facts = async (waitMs: number): Promise<Facts> => {
+    if (!held || now() - held.at >= GUIDANCE_KEEP_MS) {
+      const k = kept();
+      if (k && now() - k.at < GUIDANCE_KEEP_MS) held = { at: k.at, answer: Promise.resolve(k.facts) };
+      else {
+        const at = now();
+        held = { at, answer: load().then((c) => { keep(at, c); return c; }) };
+      }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([held.answer, new Promise<Facts>((resolve) => { timer = setTimeout(() => resolve(empty), waitMs); timer.unref?.(); })]);
+    } finally { if (timer) clearTimeout(timer); }
   };
   return {
-    async newest(waitMs) {
-      if (!held || now() - held.at >= GUIDANCE_KEEP_MS) {
-        const k = kept();
-        if (k && now() - k.at < GUIDANCE_KEEP_MS) held = { at: k.at, answer: Promise.resolve(k.change) };
-        else {
-          const at = now();
-          held = { at, answer: load().then((c) => { keep(at, c); return c; }) };
-        }
-      }
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([held.answer, new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), waitMs); timer.unref?.(); })]);
-      } finally { if (timer) clearTimeout(timer); }
-    },
+    newest: async waitMs => (await facts(waitMs)).change,
+    latestBridge: async waitMs => (await facts(waitMs)).latest,
   };
 }
 
