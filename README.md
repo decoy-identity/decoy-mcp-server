@@ -1628,6 +1628,11 @@ Anything else an agent asks for when a task needs it, on the same connection, wi
 everything that task needs in one request rather than one permission at a time. You approve or
 decline it on your phone, and the agent retries. It never pairs again to get more access.
 
+For a task on one site, ask for that site and use the accounts the owner approves. A site match
+does not grant access to other accounts on that site. With a known account id, use
+`credential_get({ id: '<uuid>' })` or `decoy://id/<uuid>/password` with `decoy-mcp-server run`
+once the account's copies are shared. Your phone shares the copies this connection can read.
+
 | | Permission | What the owner sees | Needs |
 |---|---|---|---|
 | Accounts | `account.create` | Add accounts to Decoy · Saves details for new or existing accounts | asked for alone |
