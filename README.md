@@ -1820,9 +1820,13 @@ one line, one space of indentation.
 - [Agent-readable index](https://www.decoys.me/llms.txt): entry point to the website's agent guides.
 - [Privacy policy](https://www.decoys.me/privacy): local and hosted processing, storage and access boundaries.
 
-This README is shared by the npm package and its public GitHub source. Maintainers keep the
-connection overview aligned with the website when either connection option changes; the
-website holds current app-specific setup instructions.
+This README is shared by the npm package and its public GitHub source. Whenever Decoy's public
+documentation, positioning or product changes, maintainers review and update this README and
+the package description in the same work. Keep the product overview, capabilities, connection
+options, app availability and privacy boundaries aligned with current behavior. The website
+holds current app-specific setup instructions and privacy details; link there for those.
+GitHub documentation can be refreshed between package releases; npm's published README and
+metadata change with a package publication.
 
 Changelog: [CHANGELOG.md](./CHANGELOG.md)
 
