@@ -621,6 +621,22 @@ These automatic account-linked saves do not count as the agent saving what it le
 
 ### The agent's icon
 
+Set the human-facing display name before the first approval, with its intended capitalization:
+`DECOY_AGENT_NAME` is separate from the machine's stable client id. The bridge makes and retains
+its own id; do not derive a name from it or replace a saved id to change how a connection looks.
+For an agent the bridge does not recognize, explicitly set `DECOY_AGENT_URI` to its actual
+public HTTPS site and `DECOY_AGENT_ICON` to a supported fallback. For example, a Dot running in
+ChatGPT can use `DECOY_AGENT_NAME=Dot`, `DECOY_AGENT_URI=https://chatgpt.com` and
+`DECOY_AGENT_ICON=chat-circle`. That site supplies the provider's favicon, not a personal Dot
+avatar or a verified brand badge. Names and sites are self-declared.
+
+Direct HTTP integrations use `name`, `client_uri` and `icon` in the device authorization request;
+the [task helper](https://www.decoys.me/agent-recipes.md#use-this-first) uses
+`name`, `clientUri` and `icon`. Follow the current website reference and inspect any ignored
+identity warnings. To correct an existing connection, the owner renames it in Decoy; the
+agent can update its permitted site/icon on that same connection. Do not pair a second connection
+for a cosmetic correction. Browser continuation retains the approved identity.
+
 The Decoy app shows each connection with its agent's icon: the favicon of the agent's site, else a
 picked icon. The bridge sends them to Decoy:
 
