@@ -3,18 +3,47 @@
 Your [Decoy](https://decoys.me) vault is what your agents should know about you, shared by
 every agent you connect: your memories, accounts (logins, codes, passkeys), personal info
 (emails, phones, cards, addresses) and Decoy email addresses. Your memories, accounts and personal info
-are end-to-end encrypted: Decoy's servers can't read them. Mail to your Decoy emails is
-encrypted as it arrives. You choose exactly what each agent can read or change. This package
-is the local [MCP](https://modelcontextprotocol.io) bridge to your vault, for Claude Desktop,
-Claude Code or any MCP client.
+are end-to-end encrypted. You choose exactly what each agent can read or change.
+
+**This package is Decoy's local [MCP](https://modelcontextprotocol.io) bridge. It is one way to
+connect to Decoy. Decoy also offers hosted MCP connections that run inside trusted secure
+enclaves and do not require this local bridge.**
+
+## Choose how to connect
+
+| Connection | How it works | Where to start |
+|---|---|---|
+| **Hosted MCP** | A compatible AI app connects to Decoy's remote MCP service over HTTPS. Decoy runs the connection inside a Trusted Secure Enclave; you approve its access in Decoy. You do not install this npm package or keep a local bridge running. | [Current app-specific connection steps](https://www.decoys.me/agents) |
+| **Local MCP bridge** | Your desktop assistant, coding agent or own integration runs this package. The bridge keeps its connection key and decrypts approved vault data on the machine where it runs. | [Local bridge quick start](#quick-start) below |
+
+For hosted MCP, a **Trusted Secure Enclave** is a hardware-isolated trusted execution
+environment. The connection's private keys, approved vault reads and encryption of new saves
+are handled inside that environment. Encrypted connection state is kept so the connection can
+survive restarts. See [Decoy's privacy policy](https://www.decoys.me/privacy) for the processing,
+storage and access boundaries.
+
+With either connection, the assistant and its AI provider can read and may retain information
+the assistant receives. Revoking access stops future access; it does not erase copies already
+received. A memory-only connection does not need access to your accounts or email.
+
+**App support and setup:** use [Connect your agents](https://www.decoys.me/agents) for current
+availability and instructions, and [Decoy's documentation](https://www.decoys.me/documentation)
+for the API and tool reference. MCP support alone does not establish that every AI website or
+mobile app supports the same connection flow. The npm commands, localhost URLs and local
+memory search described below apply to this bridge, not to every Decoy connection.
 
 **Agents and the vault: read before, write after.** Check the vault before asking the person.
 Save lasting facts as new memories, sensitive ones too; if you can't save, ask once for Save.
 Update a memory when its fact changes, instead of adding another. Ask for only what the task
 needs.
 
-**End-to-end encrypted.** Memories, secrets and mail are decrypted **on your machine**; Decoy's
-servers store ciphertext. Some things are plaintext to the server by design:
+## Local bridge encryption and access
+
+**End-to-end encrypted vault storage.** With this bridge, memories, secrets and saved encrypted
+mail are decrypted **on the machine running the bridge**; Decoy's vault storage holds
+ciphertext. Mail delivery systems separately process readable email for receipt, filtering,
+sending and forwarding, as described in the [privacy policy](https://www.decoys.me/privacy).
+Some things are plaintext to the server by design:
 
 - routing metadata, authorship and timestamps;
 - optional `label` and `agent_label` values;
@@ -241,14 +270,18 @@ newer one is out, once `npx -y decoy-mcp-server@<that version> --version` answer
 
 The memory tools ship in the bridge. Start it as in [Quick start](#quick-start), approve the
 connection in the Decoy app, then connect a Streamable HTTP MCP client to
-`http://127.0.0.1:3001/mcp`. A hosted agent cannot reach
-the user's localhost; run the bridge inside its trusted integration environment.
+`http://127.0.0.1:3001/mcp`. That address is local to the machine running this package; an AI
+app hosted elsewhere cannot reach the user's localhost. For hosted AI apps, use
+[Decoy's hosted MCP connection steps](https://www.decoys.me/agents). A developer running this
+package in their own integration must run it where their MCP client can reach it.
 
 Memory search uses mem0's engine locally (optional dependencies, installed with the package). Its
 embedding model (Qdrant's `bge-small-en-v1.5`) is downloaded once from a pinned Hugging Face commit,
-checked against its SHA-256, and cached under `~/.decoy/models`. Search and embeddings run on your machine. Memory text is never sent to Decoy,
-which stores ciphertext and which category, topic or account each memory is shared through, or to
-the model host. Your MCP client's model sees the memories it reads, and tags new ones through MCP
+checked against its SHA-256, and cached under `~/.decoy/models`. With this bridge, search and
+embeddings run on the machine running the bridge. The local search engine does not send memory
+text to Decoy's vault storage or to the embedding model host. Vault storage holds ciphertext and
+which category, topic or account each memory is shared through. Your MCP client's model sees
+the memories it reads, and tags new ones through MCP
 sampling. Set `DECOY_MEMORY_ENGINE=basic` to skip
 the engine and the download. The engine's optional dependencies add about 300 MB and run native
 install scripts (`better-sqlite3`, `onnxruntime-node`); to install without them, run with
@@ -687,6 +720,10 @@ computer are allowed to open, with the command that makes it private (`chmod 600
 
 ### On a hosted runtime with no lasting disk
 
+This section is for developers running this npm bridge in their own infrastructure. For
+Decoy's managed hosted MCP, follow the [AI app's connection steps](https://www.decoys.me/agents)
+instead; that flow does not ask you to move bridge keys or tokens into a secret store.
+
 Supply the connection from your secret store as environment variables. They are used only as a
 **complete set**: a key from one place is never paired with a token from another, and a partial
 set stops the bridge with a message naming the variables (never their values).
@@ -750,9 +787,9 @@ renewing, so two bridges on one connection do not both spend the refresh token. 
 file it cannot use stops the bridge; the selected connection never falls back to default files.
 On Windows, owner and mode checks do not apply; keep the file in your own private user profile.
 
-**Reconnecting a hosted connection** (its token expired, was replaced, or was lost). Nothing is
-sent from the hosted runtime: that mode never pairs. On a machine with a disk, put the key file
-this connection was paired with back at `~/.decoy/mcp-agent-key.json` first, and its id at
+**Reconnecting your own bridge runtime's connection** (its token expired, was replaced, or was
+lost). Nothing is sent from the hosted runtime: that mode never pairs. On a machine with a disk,
+put the key file this connection was paired with back at `~/.decoy/mcp-agent-key.json` first, and its id at
 `~/.decoy/mcp-client-id` (or set `DECOY_CLIENT_ID` to it). Then run
 `npx decoy-mcp-server --reconnect`, choose Reconnect in the Decoy app, and move the new tokens
 into your secret store as in step 2. **The key has to be there first.** A client id is only
@@ -1777,7 +1814,15 @@ one line, one space of indentation.
 
 ## Docs
 
-Full tool catalog and guides: **https://decoys.me/documentation**
+- [Connect your agents](https://www.decoys.me/agents): current app availability and connection steps,
+  including hosted MCP.
+- [Documentation](https://www.decoys.me/documentation): full tool catalog and API guides.
+- [Agent-readable index](https://www.decoys.me/llms.txt): entry point to the website's agent guides.
+- [Privacy policy](https://www.decoys.me/privacy): local and hosted processing, storage and access boundaries.
+
+This README is shared by the npm package and its public GitHub source. Maintainers keep the
+connection overview aligned with the website when either connection option changes; the
+website holds current app-specific setup instructions.
 
 Changelog: [CHANGELOG.md](./CHANGELOG.md)
 
