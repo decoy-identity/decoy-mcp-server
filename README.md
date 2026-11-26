@@ -1463,6 +1463,25 @@ show the person the link, in the words to use (`say`, then `after_approval`):
 {"decoy_pairing":{"url":"https://decoys.me/connect?code=ABC123&for=mcp","code":"ABC123","expires_at":"...","say":"Tap to connect Decoy:\nhttps://decoys.me/connect?code=ABC123&for=mcp","after_approval":"Connected to Decoy."}}
 ```
 
+### Account copies and owner approval (API rollout)
+
+Owner apps that declare `X-Decoy-Seals-On-Approve: 1` deliver the connection's
+current account credential copies, name copies, and readable field-key wraps
+with policy approval. Supporting server builds save the grant and copies in one
+transaction, or return `409 SEALS_REQUIRED` and save nothing. This is an interim
+API contract (SRV-T-102, retired at migration phase 5); older apps retain their
+existing approval behavior. Copies are served only under a live grant.
+
+If an account read returns `COPY_STALE`, its copy predates the account's current
+revision. Treat it as terminal: “This account changed since it was shared with
+this connection. Ask the owner to approve access again.” There is no retry hint
+and no phone push for that state. The phone is never a decryption bridge for
+these approval copies. This contract changes no setup steps, connection grants,
+or what a provider may retain after it has received data. See the
+[Decoy documentation](https://www.decoys.me/documentation)
+for current setup and deployed API details. This describes a server rollout, not an npm runtime update.
+
+
 ## How it works (read this before integrating)
 
 **An account is a login in your vault; a decoy is its Decoy email.** They're
